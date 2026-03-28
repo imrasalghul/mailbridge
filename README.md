@@ -395,6 +395,19 @@ Available AI input scopes:
 
 `AI_INPUT_SCOPE=attachments` does not read or send attachment contents to AI. It only derives attachment names locally from MIME metadata and sends those names alongside the headers. This is useful when suspicious filename patterns are part of the signal, such as receiving `Invoice.pdf` from an obviously untrusted sender domain.
 
+When AI scanning runs, Mailbridge now expects structured JSON from the model with:
+
+- `spam`: `1` or `0`
+- `reason`: a short category such as `phishing`, `impersonation`, or `crypto`
+- `score`: a spam-likelihood score from `0` to `9`
+
+`score=9` means absolutely spam. `score=0` means not at all likely to be spam.
+
+If AI is the component that classifies a message, Mailbridge injects:
+
+- `X-Mailbridge-Reason` for the short semantic category
+- `X-Mailbridge-PS` for the 0-9 probability score
+
 For OpenAI-backed deployments, review OpenAI’s business data controls and enable Zero Data Retention or stricter controls where your compliance posture requires it. For PCI/HIPAA-style environments, leave AI scanning disabled unless your legal, compliance, and vendor-review process has approved the provider path.
 
 ## Security and Reliability

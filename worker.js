@@ -3,8 +3,7 @@ let cachedPublicKeyPromise = null;
 export default {
   async email(message, env, ctx) {
     try {
-      const senderIp =
-        message.headers?.get?.("x-envelope-remote-addr") || "0.0.0.0";
+      const senderIp = getEnvelopeSenderIp(message);
       const receivedAt = new Date().toISOString();
       const encryptionVersion = env.MAIL_STORE_ENCRYPTION_VERSION || "v1";
 
@@ -216,6 +215,15 @@ async function deleteStoredMessageOrRetry({ env, msg, objectKey, reason }) {
 function makeObjectKey({ receivedAt, id }) {
   const date = receivedAt.slice(0, 10);
   return `inbound/${date}/${id}.bin`;
+}
+
+function getEnvelopeSenderIp(message) {
+  const rawValue = message?.headers?.get?.("x-envelope-remote-addr");
+  if (!rawValue) return null;
+
+  return String(rawValue)
+    .trim()
+    .replace(/^\[|\]$/g, "") || null;
 }
 
 function pemToArrayBuffer(pem) {

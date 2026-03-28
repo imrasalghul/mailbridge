@@ -199,12 +199,16 @@ async function start() {
       eventType: 'ai_result',
       direction: 'inbound',
       target: 'local_mail',
-      outcome: result === '1' ? 'spam' : result === '0' ? 'not_spam' : 'inconclusive',
+      outcome: result?.spam === '1' ? 'spam' : result?.spam === '0' ? 'not_spam' : 'inconclusive',
       sender: from,
       recipient: to,
       sourceIp,
       senderDomain,
-      details: { stage }
+      details: {
+        stage,
+        reason: result?.reason || null,
+        score: result?.score ?? null
+      }
     });
   }
 
@@ -257,6 +261,7 @@ async function start() {
     let isHardSpam = false;
     let isQuestionable = false;
     let aiConfirmedSpam = false;
+    let aiClassification = null;
     let spamSource = 'spamassassin';
     let spamReason = 'clean';
     let spamScore = null;
@@ -309,10 +314,11 @@ async function start() {
           result: aiFallback,
           stage: 'fallback'
         });
-        if (aiFallback === '1') {
+        aiClassification = aiFallback;
+        if (aiFallback?.spam === '1') {
           aiConfirmedSpam = true;
           spamReason = 'ai_fallback_spam';
-        } else if (aiFallback === '0') {
+        } else if (aiFallback?.spam === '0') {
           spamReason = 'ai_fallback_not_spam';
         } else if (!spamcFailOpen) {
           console.error(`[${requestId}] SpamAssassin and AI unavailable. Rejecting inbound mail (SPAMC_FAIL_OPEN=false).`);
@@ -365,33 +371,54 @@ async function start() {
           result: aiResult,
           stage: 'questionable'
         });
+        aiClassification = aiResult;
         spamSource = 'spamassassin+ai';
-        if (aiResult === '1') {
+        if (aiResult?.spam === '1') {
           aiConfirmedSpam = true;
           spamReason = 'sa_questionable_ai_spam';
-        } else {
+        } else if (aiResult?.spam === '0') {
           spamReason = 'sa_questionable_ai_not_spam';
+        } else {
+          spamReason = 'sa_questionable_ai_inconclusive';
         }
 
         logVerbose('[Spam]', 'AI classification executed', {
-          requestId,
-          aiResult,
-          aiConfirmedSpam
-        });
-      }
+        requestId,
+        aiResult: aiResult?.spam || null,
+        aiReason: aiResult?.reason || null,
+        aiScore: aiResult?.score ?? null,
+        aiConfirmedSpam
+      });
+    }
 
       if (!isHardSpam && !isQuestionable && !aiConfirmedSpam) {
         spamReason = 'sa_clean';
       }
 
       const finalSpamVerdict = isHardSpam || aiConfirmedSpam;
+      const mailbridgeProbabilityScore = aiClassification?.score ?? null;
+      const mailbridgeReason = finalSpamVerdict
+        ? aiClassification?.spam === '1'
+          ? aiClassification.reason
+          : gtubeDetected
+            ? 'gtube'
+            : isHardSpam
+              ? 'spam_score'
+              : 'spam'
+        : aiClassification?.spam === '0'
+          ? aiClassification.reason
+          : 'not_spam';
       logVerbose('[Spam]', 'Final verdict resolved', {
         requestId,
         finalSpamVerdict,
         spamReason,
+        mailbridgeReason,
+        mailbridgeProbabilityScore,
         spamSource,
         spamScore,
-        gtubeDetected
+        gtubeDetected,
+        aiReason: aiClassification?.reason || null,
+        aiScore: aiClassification?.score ?? null
       });
 
       const headers = buildInboundHeaders({
@@ -399,6 +426,8 @@ async function start() {
         sourceIp,
         spamSource,
         spamReason,
+        mailbridgeReason,
+        mailbridgeProbabilityScore,
         spamScore,
         finalSpamVerdict,
         spamSclScore,
