@@ -36,6 +36,8 @@ graceful_shutdown() {
 
 trap graceful_shutdown SIGINT SIGTERM
 
+mkdir -p "${DATA_DIR:-/app/data}" "${DATA_DIR:-/app/data}/queue" "$(dirname "${SECRETS_DB_PATH:-/app/secrets/secrets.db}")"
+
 log "Starting SpamAssassin"
 spamd \
   --create-prefs \

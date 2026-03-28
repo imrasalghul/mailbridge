@@ -1,53 +1,56 @@
+let cachedPublicKeyPromise = null;
+
 export default {
   async email(message, env, ctx) {
     try {
-      const senderIp =
-        message.headers?.get?.("x-envelope-remote-addr") || "0.0.0.0";
+      const senderIp = getEnvelopeSenderIp(message);
       const receivedAt = new Date().toISOString();
+      const encryptionVersion = env.MAIL_STORE_ENCRYPTION_VERSION || "v1";
 
       const id = crypto.randomUUID();
       const objectKey = makeObjectKey({
         receivedAt,
         id,
-        from: message.from,
-        to: message.to,
       });
 
       console.log("email() start", {
-        from: message.from,
-        to: message.to,
-        rawSize: message.rawSize,
         objectKey,
+        rawSize: message.rawSize,
+        encryptionVersion,
       });
 
-      // Convert the email stream into a fixed-length buffer before storing in R2
-      const rawBuffer = await new Response(message.raw).arrayBuffer();
-
-      await env.MAIL_STORE.put(objectKey, rawBuffer, {
-        httpMetadata: {
-          contentType: "message/rfc822",
-        },
-        customMetadata: {
+      const rawText = await new Response(message.raw).text();
+      const encryptedPayload = await encryptEnvelope({
+        env,
+        payload: {
+          version: encryptionVersion,
           from: message.from || "",
           to: message.to || "",
           senderIp,
+          raw: rawText,
           receivedAt,
-          rawSize: String(message.rawSize || 0),
+        },
+        version: encryptionVersion,
+      });
+
+      await env.MAIL_STORE.put(objectKey, JSON.stringify(encryptedPayload), {
+        httpMetadata: {
+          contentType: "application/json",
+        },
+        customMetadata: {
+          encryptionVersion,
+          receivedAt,
         },
       });
 
-      console.log("stored in R2", { objectKey });
+      console.log("stored encrypted object in R2", { objectKey });
 
       await env.MAIL_QUEUE.send({
         objectKey,
-        from: message.from || "",
-        to: message.to || "",
-        senderIp,
-        receivedAt,
-        rawSize: message.rawSize || 0,
+        encryptionVersion,
       });
 
-      console.log("queued message", { objectKey });
+      console.log("queued message", { objectKey, encryptionVersion });
     } catch (err) {
       console.error("email() failed", {
         message: err?.message || String(err),
@@ -59,11 +62,14 @@ export default {
 
   async queue(batch, env, ctx) {
     for (const msg of batch.messages) {
-      const payload = msg.body;
-      const { objectKey, from, to, senderIp } = payload;
+      const payload = msg.body || {};
+      const { objectKey, encryptionVersion } = payload;
 
       try {
-        console.log("queue() processing", { objectKey });
+        console.log("queue() processing", {
+          objectKey,
+          encryptionVersion: encryptionVersion || "legacy",
+        });
 
         const object = await env.MAIL_STORE.get(objectKey);
 
@@ -73,7 +79,11 @@ export default {
           continue;
         }
 
-        const rawEmail = await object.text();
+        const requestBody = await buildBridgeRequestBody({
+          object,
+          objectKey,
+          payload,
+        });
 
         const response = await fetch(env.NODE_APP_URL, {
           method: "POST",
@@ -81,12 +91,7 @@ export default {
             "Content-Type": "application/json",
             "X-Webhook-Secret": env.WEBHOOK_SECRET,
           },
-          body: JSON.stringify({
-            from,
-            to,
-            raw: rawEmail,
-            senderIp,
-          }),
+          body: JSON.stringify(requestBody),
         });
 
         if (response.ok) {
@@ -131,6 +136,66 @@ export default {
   },
 };
 
+async function buildBridgeRequestBody({ object, objectKey, payload }) {
+  if (payload?.encryptionVersion === "v1") {
+    const encryptedPayload = JSON.parse(await object.text());
+    return { encryptedPayload };
+  }
+
+  return {
+    from: payload.from,
+    to: payload.to,
+    raw: await object.text(),
+    senderIp: payload.senderIp,
+  };
+}
+
+async function encryptEnvelope({ env, payload, version }) {
+  const publicKey = await getPublicKey(env);
+  const dataKeyBytes = crypto.getRandomValues(new Uint8Array(32));
+  const ivBytes = crypto.getRandomValues(new Uint8Array(12));
+  const aesKey = await crypto.subtle.importKey(
+    "raw",
+    dataKeyBytes,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt"]
+  );
+  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: ivBytes },
+    aesKey,
+    plaintext
+  );
+  const wrappedKey = await crypto.subtle.encrypt(
+    { name: "RSA-OAEP" },
+    publicKey,
+    dataKeyBytes
+  );
+
+  return {
+    version,
+    algorithm: "RSA-OAEP-256+A256GCM",
+    wrappedKey: arrayBufferToBase64(wrappedKey),
+    iv: arrayBufferToBase64(ivBytes),
+    ciphertext: arrayBufferToBase64(ciphertext),
+  };
+}
+
+async function getPublicKey(env) {
+  if (!cachedPublicKeyPromise) {
+    cachedPublicKeyPromise = crypto.subtle.importKey(
+      "spki",
+      pemToArrayBuffer(env.MAILBRIDGE_PUBLIC_KEY_PEM),
+      { name: "RSA-OAEP", hash: "SHA-256" },
+      false,
+      ["encrypt"]
+    );
+  }
+
+  return cachedPublicKeyPromise;
+}
+
 async function deleteStoredMessageOrRetry({ env, msg, objectKey, reason }) {
   try {
     await env.MAIL_STORE.delete(objectKey);
@@ -147,16 +212,36 @@ async function deleteStoredMessageOrRetry({ env, msg, objectKey, reason }) {
   }
 }
 
-function makeObjectKey({ receivedAt, id, from, to }) {
+function makeObjectKey({ receivedAt, id }) {
   const date = receivedAt.slice(0, 10);
-  return `inbound/${date}/${id}__from_${sanitizeForKey(from)}__to_${sanitizeForKey(to)}.eml`;
+  return `inbound/${date}/${id}.bin`;
 }
 
-function sanitizeForKey(value) {
-  return String(value || "unknown")
-    .toLowerCase()
-    .replace(/[^a-z0-9@._+-]+/g, "_")
-    .slice(0, 120);
+function getEnvelopeSenderIp(message) {
+  const rawValue = message?.headers?.get?.("x-envelope-remote-addr");
+  if (!rawValue) return null;
+
+  return String(rawValue)
+    .trim()
+    .replace(/^\[|\]$/g, "") || null;
+}
+
+function pemToArrayBuffer(pem) {
+  const base64 = String(pem || "")
+    .replace(/-----BEGIN [^-]+-----/g, "")
+    .replace(/-----END [^-]+-----/g, "")
+    .replace(/\s+/g, "");
+
+  return Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+}
+
+function arrayBufferToBase64(value) {
+  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
 }
 
 function getRetryDelaySeconds(attempts) {
