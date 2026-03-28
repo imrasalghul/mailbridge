@@ -34,7 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends cloudflared \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /var/run/spamassassin /etc/default /app \
+RUN mkdir -p /var/run/spamassassin /etc/default /app /app/data /app/data/queue /app/secrets \
     && echo "ENABLED=1" > /etc/default/spamassassin \
     && echo 'OPTIONS="--create-prefs --max-children 5 --helper-home-dir"' >> /etc/default/spamassassin \
     && chown -R node:node /var/run/spamassassin /app /home/node

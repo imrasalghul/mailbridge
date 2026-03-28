@@ -13,6 +13,7 @@
     "express": "^4.18.2",
     "mailparser": "^3.7.4",
     "nodemailer": "^8.0.4",
+    "openai": "^6.33.0",
     "smtp-server": "^3.14.0",
     "spamc": "^0.0.5",
     "sqlite3": "^6.0.1"

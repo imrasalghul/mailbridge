@@ -5,8 +5,10 @@ services:
     restart: unless-stopped
     ports:
       - "3090:3090"
-      - "2525:2525"
     env_file: .env
+    volumes:
+      - "./data:/app/data"
+      - "./secrets:/app/secrets"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3090/health"]
       interval: 30s
