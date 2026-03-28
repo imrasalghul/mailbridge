@@ -1,0 +1,14 @@
+services:
+  mail-bridge:
+    build: .
+    container_name: mail-bridge
+    restart: unless-stopped
+    ports:
+      - "3090:3090"
+      - "2525:2525"
+    env_file: .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

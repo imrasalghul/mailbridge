@@ -1,0 +1,13 @@
+.env*
+.git
+.gitignore
+mail_queue.sqlite
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+coverage
+.nyc_output
+.cache
+dist
+*.log
