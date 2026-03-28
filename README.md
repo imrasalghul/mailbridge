@@ -1,19 +1,19 @@
 # Mailbridge
 
-Mailbridge bridges Cloudflare Email Workers to a local mail server for inbound mail, and can relay trusted SMTP traffic to SendGrid for outbound mail.
+Mailbridge bridges Cloudflare Email Workers to a local mail server for inbound mail, and can relay trusted SMTP traffic to SendGrid, Resend, or Mailgun for outbound mail.
 
 ## Overview
 
 - Inbound flow: Sender -> Cloudflare Email Worker -> encrypted R2 object -> Cloudflare Queue -> Mailbridge webhook -> local mail server
-- Outbound flow: trusted SMTP client -> Mailbridge SMTP relay -> SendGrid API
+- Outbound flow: trusted SMTP client -> Mailbridge SMTP relay -> selected upstream provider API
 
 ## Key Features
 
 - Multi-layer inbound filtering with SpamAssassin and optional AI review
 - Optional Spamhaus sender-IP and sender-domain reputation checks
 - HTTP webhook intake for Cloudflare Email Workers
-- Optional SMTP relay for local systems that need to hand outbound mail to SendGrid
-- Encrypted file-backed retry queue for temporary local-mail and SendGrid failures
+- Optional SMTP relay for local systems that need to hand outbound mail to SendGrid, Resend, or Mailgun
+- Encrypted file-backed retry queue for temporary local-mail and upstream provider failures
 - Audit-only SQLite storage at `data/mailbridge.db`
 - Separate queue-secrets storage at `secrets/secrets.db`
 - Public-key encryption for mail stored in R2 so only Mailbridge can decrypt it
@@ -61,8 +61,10 @@ WEBHOOK_SECRET=replace_with_a_shared_secret
 LOCAL_MAIL_HOST=mail.internal.example
 LOCAL_MAIL_PORT=25
 
-SENDGRID_API_KEY=SG.your_api_key
-SENDGRID_FROM_FALLBACK=relay@example.com
+RELAY_UPSTREAM_PROVIDER=sendgrid
+RELAY_API_KEY=replace_with_provider_api_key
+RELAY_FROM_FALLBACK=relay@example.com
+MAILGUN_DOMAIN=mg.example.com
 
 DATA_DIR=/app/data
 SECRETS_DB_PATH=/app/secrets/secrets.db
@@ -76,6 +78,9 @@ Important notes:
 - `WEBHOOK_SECRET` must match the `WEBHOOK_SECRET` secret configured on the Cloudflare Worker.
 - `QUEUE_MASTER_KEY` is mandatory. Mailbridge uses it together with a random per-message secret stored in `secrets.db` to decrypt locally queued mail.
 - `MAILBRIDGE_PRIVATE_KEY_PATH` points to the private key Mailbridge uses to decrypt inbound mail that the Worker encrypted before storing in R2.
+- `RELAY_UPSTREAM_PROVIDER` accepts `sendgrid`, `resend`, or `mailgun`.
+- `RELAY_API_KEY` is the outbound API credential used for the selected provider.
+- `MAILGUN_DOMAIN` is required only when `RELAY_UPSTREAM_PROVIDER=mailgun`. If you use Mailgun EU, set `MAILGUN_BASE_URL=https://api.eu.mailgun.net`.
 - `SPAMHAUS_ENABLED=false` and `AI_ENABLED=false` in `.env.example` are intentional. Both controls are optional and must be enabled deliberately.
 - SMTP relay TLS is fail-closed by default. If you want to use the relay, set `SMTP_RELAY_TLS_CERT_FILE` and `SMTP_RELAY_TLS_KEY_FILE` before exposing or using port `2525`.
 - Local mail delivery is TLS-first by default. If your local mail server does not support a verifiable TLS path yet, you must explicitly opt out with `LOCAL_MAIL_REQUIRE_TLS=false` and, if needed, `LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED=false`.
@@ -297,6 +302,28 @@ The SMTP relay is designed to be locked down before use:
 
 This means the relay is not meant to be a general plaintext LAN service anymore. If you need a temporary lab-only exception, use explicit opt-out settings instead of relying on old defaults.
 
+### Upstream Provider Selection
+
+Outbound relay delivery is provider-selectable:
+
+```dotenv
+RELAY_UPSTREAM_PROVIDER=sendgrid
+RELAY_API_KEY=...
+RELAY_FROM_FALLBACK=relay@example.com
+```
+
+Supported values:
+
+- `sendgrid`
+- `resend`
+- `mailgun`
+
+Provider notes:
+
+- `sendgrid`: uses the SendGrid Mail Send API
+- `resend`: uses the Resend send email API
+- `mailgun`: uses the Mailgun MIME send API and also requires `MAILGUN_DOMAIN`
+
 ### Queued Message Encryption and Secret Separation
 
 Queued mail is encrypted at rest:
@@ -374,7 +401,7 @@ For OpenAI-backed deployments, review OpenAI’s business data controls and enab
 
 - All inbound webhook requests require the shared `X-Webhook-Secret` header.
 - Inbound sender reputation uses the original sender IP from the decrypted Worker payload, not the Worker request IP.
-- Temporary local-mail or SendGrid failures are queued and retried.
+- Temporary local-mail or upstream provider failures are queued and retried.
 - Queued messages are encrypted at rest and are written only when delivery must be deferred.
 - R2-stored inbound mail is encrypted before storage and only Mailbridge can decrypt it.
 - Permanent SMTP or API failures are rejected instead of retried forever.

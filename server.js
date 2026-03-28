@@ -11,9 +11,11 @@ const { createAuditLogStore } = require('./lib/audit-log-store');
 const { extractDomainFromAddress } = require('./lib/email-metadata');
 const { createInboundMessageDecryptor } = require('./lib/inbound-message-crypto');
 const { createLocalMailTransport } = require('./lib/local-mail-transport');
+const { createMailgunDelivery } = require('./lib/mailgun-delivery');
 const { createQueueCrypto } = require('./lib/queue-crypto');
 const { createQueueManager } = require('./lib/queue-manager');
 const { createQueueStore } = require('./lib/queue-store');
+const { createResendDelivery } = require('./lib/resend-delivery');
 const { createSendGridDelivery } = require('./lib/sendgrid-delivery');
 const { createSpamAssassinClient } = require('./lib/spamassassin-client');
 const { createSpamhausClient } = require('./lib/spamhaus-client');
@@ -25,6 +27,12 @@ const {
 } = require('./lib/spam-pipeline');
 const { buildSmtpRelayPolicy } = require('./lib/smtp-relay-policy');
 const { createSmtpRelayServer } = require('./lib/smtp-relay-server');
+const { createUpstreamEmailDelivery } = require('./lib/upstream-email-delivery');
+const {
+  assertSupportedUpstreamProvider,
+  formatUpstreamProviderLabel,
+  isOutboundTarget
+} = require('./lib/upstream-provider');
 const { validateWebhookRequest } = require('./lib/webhook-intake');
 
 function parseBoolean(value, defaultValue) {
@@ -49,6 +57,9 @@ const verboseAppLogging = parseBoolean(process.env.MAILBRIDGE_VERBOSE_LOGGING, t
 const verboseSmtpRelayLogging = parseBoolean(process.env.SMTP_RELAY_VERBOSE_LOGGING, true);
 const smtpRelayInjectHeaders = parseBoolean(process.env.SMTP_RELAY_INJECT_HEADERS, true);
 const spamcFailOpen = parseBoolean(process.env.SPAMC_FAIL_OPEN, false);
+const configuredUpstreamProvider = assertSupportedUpstreamProvider(process.env.RELAY_UPSTREAM_PROVIDER || 'sendgrid');
+const relayApiKey = process.env.RELAY_API_KEY || '';
+const relayFromFallback = process.env.RELAY_FROM_FALLBACK || process.env.SENDGRID_FROM_FALLBACK || 'postmaster@localhost';
 
 function logVerbose(scope, message, details = {}) {
   if (!verboseAppLogging) return;
@@ -100,11 +111,34 @@ async function start() {
   const localMailTransport = createLocalMailTransport();
   const smtpRelayPolicy = buildSmtpRelayPolicy();
   const sendViaSendGrid = createSendGridDelivery({
-    apiKey: process.env.SENDGRID_API_KEY,
+    apiKey: relayApiKey,
     injectHeaders: smtpRelayInjectHeaders,
     relayHostname: mailbridgeHostname,
-    sendgridFromFallback: process.env.SENDGRID_FROM_FALLBACK,
+    fromFallback: relayFromFallback,
     log: logVerbose
+  });
+  const sendViaResend = createResendDelivery({
+    apiKey: relayApiKey,
+    baseUrl: process.env.RESEND_BASE_URL || 'https://api.resend.com',
+    injectHeaders: smtpRelayInjectHeaders,
+    relayHostname: mailbridgeHostname,
+    fromFallback: relayFromFallback,
+    log: logVerbose
+  });
+  const sendViaMailgun = createMailgunDelivery({
+    apiKey: relayApiKey,
+    domain: process.env.MAILGUN_DOMAIN,
+    baseUrl: process.env.MAILGUN_BASE_URL || 'https://api.mailgun.net',
+    injectHeaders: smtpRelayInjectHeaders,
+    relayHostname: mailbridgeHostname,
+    fromFallback: relayFromFallback,
+    log: logVerbose
+  });
+  const sendViaUpstream = createUpstreamEmailDelivery({
+    defaultProvider: configuredUpstreamProvider,
+    sendgridDelivery: sendViaSendGrid,
+    resendDelivery: sendViaResend,
+    mailgunDelivery: sendViaMailgun
   });
   const spamAssassinClient = createSpamAssassinClient({
     host: process.env.SPAMD_HOST || '127.0.0.1',
@@ -125,18 +159,24 @@ async function start() {
     auditStore,
     maxQueueAttempts,
     async deliverQueuedMessage(row) {
-      if (row.target === 'sendgrid') {
-        logSmtpRelay('[Queue->SendGrid]', 'Retrying delivery', {
+      if (isOutboundTarget(row.target)) {
+        const providerLabel = formatUpstreamProviderLabel(row.target);
+        logSmtpRelay(`[Queue->${providerLabel}]`, 'Retrying delivery', {
           queueId: row.id,
           from: row.sender,
           to: row.recipient,
           attempts: row.attempts
         });
-        const sendGridResult = await sendViaSendGrid(row.sender, [row.recipient], row.raw_content);
-        logSmtpRelay('[Queue->SendGrid]', 'Delivery accepted by SendGrid', {
+        const upstreamResult = await sendViaUpstream({
+          provider: row.target,
+          from: row.sender,
+          to: [row.recipient],
+          rawInput: row.raw_content
+        });
+        logSmtpRelay(`[Queue->${providerLabel}]`, `Delivery accepted by ${providerLabel}`, {
           queueId: row.id,
-          status: sendGridResult?.status,
-          messageId: sendGridResult?.messageId
+          status: upstreamResult?.status,
+          messageId: upstreamResult?.messageId
         });
         return;
       }
@@ -432,9 +472,10 @@ async function start() {
     verboseAppLogging,
     socketTimeoutMs: Number.parseInt(process.env.SMTP_RELAY_SOCKET_TIMEOUT_MS || '120000', 10),
     logSmtpRelay,
-    sendViaSendGrid,
+    sendViaUpstream,
     addToQueue: queueManager.addToQueue,
-    sendgridFromFallback: process.env.SENDGRID_FROM_FALLBACK,
+    relayFromFallback,
+    upstreamProvider: configuredUpstreamProvider,
     policy: smtpRelayPolicy,
     auditStore
   });
