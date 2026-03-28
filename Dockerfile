@@ -1,7 +1,8 @@
 FROM node:22-trixie-slim AS deps
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    NODE_ENV=production
+    NODE_ENV=production \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 WORKDIR /app
 
@@ -17,13 +18,14 @@ RUN npm ci --omit=dev
 FROM node:22-trixie-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    NODE_ENV=production
+    NODE_ENV=production \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     gnupg \
-    spamassassin \
+    spamd \
     spamc \
     && install -m 0755 -d /usr/share/keyrings \
     && curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \

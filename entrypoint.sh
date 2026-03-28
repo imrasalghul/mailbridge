@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
 SPAMD_PID=""
 MAILBRIDGE_PID=""
 CLOUDFLARED_PID=""
@@ -38,8 +40,32 @@ trap graceful_shutdown SIGINT SIGTERM
 
 mkdir -p "${DATA_DIR:-/app/data}" "${DATA_DIR:-/app/data}/queue" "$(dirname "${SECRETS_DB_PATH:-/app/secrets/secrets.db}")"
 
+resolve_spamd_bin() {
+  if [[ -n "${SPAMD_BIN:-}" ]] && [[ -x "${SPAMD_BIN}" ]]; then
+    printf '%s\n' "${SPAMD_BIN}"
+    return 0
+  fi
+
+  if command -v spamd >/dev/null 2>&1; then
+    command -v spamd
+    return 0
+  fi
+
+  if [[ -x /usr/sbin/spamd ]]; then
+    printf '%s\n' "/usr/sbin/spamd"
+    return 0
+  fi
+
+  return 1
+}
+
+if ! SPAMD_BIN="$(resolve_spamd_bin)"; then
+  echo "[entrypoint] spamd was not found in PATH or /usr/sbin. Verify the image includes the SpamAssassin daemon." >&2
+  exit 127
+fi
+
 log "Starting SpamAssassin"
-spamd \
+"${SPAMD_BIN}" \
   --create-prefs \
   --helper-home-dir \
   --listen 127.0.0.1 \
