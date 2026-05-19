@@ -1,0 +1,25 @@
+name = "mailbridge-worker"
+main = "worker.js"
+compatibility_date = "2026-05-19"
+preview_urls = false
+
+[vars]
+NODE_APP_URL = "https://mailbridge.example.com/api/webhook/email"
+MAIL_STORE_ENCRYPTION_VERSION = "v1"
+
+[[r2_buckets]]
+binding = "MAIL_STORE"
+bucket_name = "mailbridge-inbound"
+
+[[queues.producers]]
+binding = "MAIL_QUEUE"
+queue = "mailbridge-inbound"
+
+[[queues.consumers]]
+queue = "mailbridge-inbound"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3
+
+[[send_email]]
+name = "EMAIL"

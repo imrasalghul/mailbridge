@@ -81,7 +81,7 @@ async function createHarness(t, options = {}) {
   };
 }
 
-test('explicit permanent=false keeps 5xx sendgrid-style errors retryable', () => {
+test('explicit permanent=false keeps 5xx upstream errors retryable', () => {
   assert.equal(
     isPermanentDeliveryError({ statusCode: 503, permanent: false }),
     false
@@ -228,7 +228,7 @@ test('queue manager retries temporary failures and removes delivered messages', 
 
 test('queue manager drops permanently failed messages', async (t) => {
   const harness = await createHarness(t);
-  await harness.queueStore.addToQueue('alice@example.com', 'bob@example.com', 'Subject: Fail\r\n\r\nNope', 'sendgrid');
+  await harness.queueStore.addToQueue('alice@example.com', 'bob@example.com', 'Subject: Fail\r\n\r\nNope', 'cloudflare');
 
   const queueManager = createQueueManager({
     store: harness.queueStore,

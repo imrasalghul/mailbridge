@@ -1,0 +1,98 @@
+name: Self-hosted Email Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      smtp_host:
+        description: Mailbridge SMTP relay host reachable from the self-hosted runner
+        required: true
+        default: "127.0.0.1"
+      smtp_port:
+        description: Mailbridge SMTP relay port
+        required: true
+        default: "2525"
+      require_tls:
+        description: Require STARTTLS before sending
+        required: true
+        default: "true"
+      tls_reject_unauthorized:
+        description: Reject untrusted SMTP TLS certificates
+        required: true
+        default: "true"
+
+jobs:
+  send-test-email:
+    runs-on: self-hosted
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Send SMTP relay test email
+        env:
+          SMTP_HOST: ${{ inputs.smtp_host }}
+          SMTP_PORT: ${{ inputs.smtp_port }}
+          SMTP_REQUIRE_TLS: ${{ inputs.require_tls }}
+          SMTP_TLS_REJECT_UNAUTHORIZED: ${{ inputs.tls_reject_unauthorized }}
+          SMTP_USER: ${{ secrets.MAILBRIDGE_TEST_SMTP_USER }}
+          SMTP_PASS: ${{ secrets.MAILBRIDGE_TEST_SMTP_PASS }}
+        run: |
+          node <<'NODE'
+          const nodemailer = require('nodemailer');
+
+          function parseBoolean(value, defaultValue) {
+            if (value === undefined || value === null || value === '') return defaultValue;
+            return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+          }
+
+          const auth = process.env.SMTP_USER || process.env.SMTP_PASS
+            ? { user: process.env.SMTP_USER || '', pass: process.env.SMTP_PASS || '' }
+            : undefined;
+
+          const transport = nodemailer.createTransport({
+            host: process.env.SMTP_HOST,
+            port: Number.parseInt(process.env.SMTP_PORT || '2525', 10),
+            secure: false,
+            requireTLS: parseBoolean(process.env.SMTP_REQUIRE_TLS, true),
+            auth,
+            tls: {
+              rejectUnauthorized: parseBoolean(process.env.SMTP_TLS_REJECT_UNAUTHORIZED, true)
+            }
+          });
+
+          async function main() {
+            const info = await transport.sendMail({
+              envelope: {
+                from: 'test@bots.alghull.com',
+                to: ['ras@alghul.com']
+              },
+              from: 'Mailbridge Self-hosted Test <test@bots.alghull.com>',
+              to: 'ras@alghul.com',
+              subject: `Mailbridge self-hosted SMTP test ${new Date().toISOString()}`,
+              text: [
+                'Mailbridge self-hosted SMTP relay test.',
+                '',
+                `Repository: ${process.env.GITHUB_REPOSITORY || 'unknown'}`,
+                `Run: ${process.env.GITHUB_SERVER_URL || 'https://github.com'}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+                `Commit: ${process.env.GITHUB_SHA || 'unknown'}`
+              ].join('\n')
+            });
+
+            console.log(`Sent test email: ${info.messageId || 'accepted'}`);
+          }
+
+          main().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
