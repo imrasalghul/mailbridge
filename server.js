@@ -8,6 +8,7 @@ const sqlite3 = require('sqlite3').verbose();
 
 const { createAiClassifier } = require('./lib/ai-classifier');
 const { createAuditLogStore } = require('./lib/audit-log-store');
+const { createCloudflareDelivery } = require('./lib/cloudflare-delivery');
 const { extractDomainFromAddress } = require('./lib/email-metadata');
 const { createInboundMessageDecryptor } = require('./lib/inbound-message-crypto');
 const { createLocalMailTransport } = require('./lib/local-mail-transport');
@@ -55,6 +56,7 @@ const spamSubjectTag = process.env.SPAM_SUBJECT_TAG || '[SPAM]';
 const mailbridgeHostname = process.env.MAILBRIDGE_HOSTNAME || 'mailbridge.example.com';
 const verboseAppLogging = parseBoolean(process.env.MAILBRIDGE_VERBOSE_LOGGING, true);
 const verboseSmtpRelayLogging = parseBoolean(process.env.SMTP_RELAY_VERBOSE_LOGGING, true);
+const smtpRelayEnabled = parseBoolean(process.env.SMTP_RELAY_ENABLED, false);
 const smtpRelayInjectHeaders = parseBoolean(process.env.SMTP_RELAY_INJECT_HEADERS, true);
 const spamcFailOpen = parseBoolean(process.env.SPAMC_FAIL_OPEN, false);
 const configuredUpstreamProvider = assertSupportedUpstreamProvider(process.env.RELAY_UPSTREAM_PROVIDER || 'sendgrid');
@@ -109,7 +111,6 @@ async function start() {
   await queueStore.migrateLegacyQueue(legacyDbPath);
 
   const localMailTransport = createLocalMailTransport();
-  const smtpRelayPolicy = buildSmtpRelayPolicy();
   const sendViaSendGrid = createSendGridDelivery({
     apiKey: relayApiKey,
     injectHeaders: smtpRelayInjectHeaders,
@@ -134,11 +135,20 @@ async function start() {
     fromFallback: relayFromFallback,
     log: logVerbose
   });
+  const sendViaCloudflare = createCloudflareDelivery({
+    workerUrl: process.env.CLOUDFLARE_SEND_WORKER_URL,
+    webhookSecret: process.env.CLOUDFLARE_SEND_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET,
+    injectHeaders: smtpRelayInjectHeaders,
+    relayHostname: mailbridgeHostname,
+    fromFallback: relayFromFallback,
+    log: logVerbose
+  });
   const sendViaUpstream = createUpstreamEmailDelivery({
     defaultProvider: configuredUpstreamProvider,
     sendgridDelivery: sendViaSendGrid,
     resendDelivery: sendViaResend,
-    mailgunDelivery: sendViaMailgun
+    mailgunDelivery: sendViaMailgun,
+    cloudflareDelivery: sendViaCloudflare
   });
   const spamAssassinClient = createSpamAssassinClient({
     host: process.env.SPAMD_HOST || '127.0.0.1',
@@ -497,22 +507,28 @@ async function start() {
     }
   });
 
-  const smtpRelayServer = createSmtpRelayServer({
-    verboseAppLogging,
-    socketTimeoutMs: Number.parseInt(process.env.SMTP_RELAY_SOCKET_TIMEOUT_MS || '120000', 10),
-    logSmtpRelay,
-    sendViaUpstream,
-    addToQueue: queueManager.addToQueue,
-    relayFromFallback,
-    upstreamProvider: configuredUpstreamProvider,
-    policy: smtpRelayPolicy,
-    auditStore
-  });
-
   app.listen(port, '0.0.0.0', () => console.log(`Mail Bridge HTTP listener running on port ${port}`));
-  smtpRelayServer.listen(smtpRelayPort, '0.0.0.0', () => {
-    console.log(`Mail Bridge SMTP relay running on port ${smtpRelayPort}`);
-  });
+
+  if (smtpRelayEnabled) {
+    const smtpRelayPolicy = buildSmtpRelayPolicy();
+    const smtpRelayServer = createSmtpRelayServer({
+      verboseAppLogging,
+      socketTimeoutMs: Number.parseInt(process.env.SMTP_RELAY_SOCKET_TIMEOUT_MS || '120000', 10),
+      logSmtpRelay,
+      sendViaUpstream,
+      addToQueue: queueManager.addToQueue,
+      relayFromFallback,
+      upstreamProvider: configuredUpstreamProvider,
+      policy: smtpRelayPolicy,
+      auditStore
+    });
+
+    smtpRelayServer.listen(smtpRelayPort, '0.0.0.0', () => {
+      console.log(`Mail Bridge SMTP relay running on port ${smtpRelayPort}`);
+    });
+  } else {
+    console.log('Mail Bridge SMTP relay disabled. Set SMTP_RELAY_ENABLED=true to enable outbound relay.');
+  }
 }
 
 start().catch((error) => {

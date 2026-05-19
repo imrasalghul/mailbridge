@@ -12,6 +12,30 @@ log() {
   echo "[entrypoint] $*"
 }
 
+wait_for_spamd() {
+  local host="${SPAMD_HOST:-127.0.0.1}"
+  local port="${SPAMD_PORT:-783}"
+  local attempts="${SPAMD_STARTUP_ATTEMPTS:-30}"
+
+  for attempt in $(seq 1 "$attempts"); do
+    if timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/$2"; printf "PING SPAMC/1.5\r\n\r\n" >&3; IFS= read -r response <&3; [[ "$response" == SPAMD/* ]]' _ "$host" "$port" 2>/dev/null; then
+      log "SpamAssassin is accepting connections on ${host}:${port}"
+      return 0
+    fi
+
+    if ! kill -0 "$SPAMD_PID" 2>/dev/null; then
+      echo "[entrypoint] SpamAssassin exited before accepting connections" >&2
+      return 1
+    fi
+
+    log "Waiting for SpamAssassin on ${host}:${port} (${attempt}/${attempts})"
+    sleep 1
+  done
+
+  echo "[entrypoint] SpamAssassin did not accept connections on ${host}:${port} after ${attempts}s" >&2
+  return 1
+}
+
 stop_pid() {
   local pid="${1:-}"
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
@@ -70,8 +94,14 @@ log "Starting SpamAssassin"
   --helper-home-dir \
   --listen 127.0.0.1 \
   --max-children 5 \
+  --syslog=stderr \
   --port "${SPAMD_PORT:-783}" &
 SPAMD_PID=$!
+
+if ! wait_for_spamd; then
+  stop_all
+  exit 1
+fi
 
 if [[ "${CLOUDFLARED_ENABLED:-false}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss])$ ]]; then
   if [[ -z "${CLOUDFLARED_TUNNEL_TOKEN:-}" ]]; then
