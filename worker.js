@@ -1,6 +1,16 @@
 let cachedPublicKeyPromise = null;
+const DEFAULT_BRIDGE_WEBHOOK_PATH = "/api/webhook/email";
 
 export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname !== "/api/send/email") {
+      return new Response("Not found", { status: 404 });
+    }
+
+    return handleSendEmailRequest(request, env);
+  },
+
   async email(message, env, ctx) {
     try {
       const senderIp = getEnvelopeSenderIp(message);
@@ -85,7 +95,8 @@ export default {
           payload,
         });
 
-        const response = await fetch(env.NODE_APP_URL, {
+        const bridgeUrl = buildBridgeEndpointUrl(env.NODE_APP_URL);
+        const response = await fetch(bridgeUrl, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -135,6 +146,79 @@ export default {
     }
   },
 };
+
+async function handleSendEmailRequest(request, env) {
+  if (request.method !== "POST") {
+    return jsonResponse({ error: "Method not allowed" }, 405);
+  }
+  if (!env.EMAIL?.send) {
+    return jsonResponse({ error: "EMAIL binding is not configured" }, 500);
+  }
+  if (!env.WEBHOOK_SECRET) {
+    return jsonResponse({ error: "WEBHOOK_SECRET is not configured" }, 500);
+  }
+  if (request.headers.get("X-Webhook-Secret") !== env.WEBHOOK_SECRET) {
+    return jsonResponse({ error: "Invalid Secret" }, 403);
+  }
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON" }, 400);
+  }
+
+  try {
+    const result = await env.EMAIL.send(payload);
+    return jsonResponse({ success: true, messageId: result?.messageId || null });
+  } catch (err) {
+    const status = mapEmailSendErrorStatus(err);
+    console.error("EMAIL.send failed", {
+      code: err?.code || null,
+      message: err?.message || String(err),
+    });
+    return jsonResponse({
+      success: false,
+      code: err?.code || null,
+      error: err?.message || String(err),
+    }, status);
+  }
+}
+
+function mapEmailSendErrorStatus(err) {
+  switch (err?.code) {
+    case "E_RATE_LIMIT_EXCEEDED":
+    case "E_DAILY_LIMIT_EXCEEDED":
+      return 429;
+    case "E_INTERNAL_SERVER_ERROR":
+    case "E_DELIVERY_FAILED":
+      return 502;
+    default:
+      return 400;
+  }
+}
+
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+    },
+  });
+}
+
+function buildBridgeEndpointUrl(value) {
+  if (!value) {
+    throw new Error("NODE_APP_URL is not configured");
+  }
+
+  const url = new URL(value);
+  if (!url.pathname || url.pathname === "/") {
+    url.pathname = DEFAULT_BRIDGE_WEBHOOK_PATH;
+  }
+
+  return url.toString();
+}
 
 async function buildBridgeRequestBody({ object, objectKey, payload }) {
   if (payload?.encryptionVersion === "v1") {
@@ -251,6 +335,11 @@ function getRetryDelaySeconds(attempts) {
   if (attempts === 4) return 600;
   return 1800;
 }
+
+export {
+  buildBridgeEndpointUrl,
+  DEFAULT_BRIDGE_WEBHOOK_PATH,
+};
 
 async function safeReadText(response) {
   try {

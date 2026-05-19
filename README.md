@@ -1,6 +1,6 @@
 # Mailbridge
 
-Mailbridge bridges Cloudflare Email Workers to a local mail server for inbound mail, and can relay trusted SMTP traffic to SendGrid, Resend, or Mailgun for outbound mail.
+Mailbridge bridges Cloudflare Email Workers to a local mail server for inbound mail, and can relay trusted SMTP traffic to SendGrid, Resend, Mailgun, or Cloudflare Email Service for outbound mail.
 
 ## Overview
 
@@ -12,7 +12,7 @@ Mailbridge bridges Cloudflare Email Workers to a local mail server for inbound m
 - Multi-layer inbound filtering with SpamAssassin and optional AI review
 - Optional Spamhaus sender-IP and sender-domain reputation checks
 - HTTP webhook intake for Cloudflare Email Workers
-- Optional SMTP relay for local systems that need to hand outbound mail to SendGrid, Resend, or Mailgun
+- Optional SMTP relay for local systems that need to hand outbound mail to SendGrid, Resend, Mailgun, or Cloudflare Email Service
 - Encrypted file-backed retry queue for temporary local-mail and upstream provider failures
 - Audit-only SQLite storage at `data/mailbridge.db`
 - Separate queue-secrets storage at `secrets/secrets.db`
@@ -65,6 +65,8 @@ RELAY_UPSTREAM_PROVIDER=sendgrid
 RELAY_API_KEY=replace_with_provider_api_key
 RELAY_FROM_FALLBACK=relay@example.com
 MAILGUN_DOMAIN=mg.example.com
+CLOUDFLARE_SEND_WORKER_URL=https://mailbridge-worker.example.workers.dev/api/send/email
+CLOUDFLARE_SEND_WEBHOOK_SECRET=replace_with_worker_send_secret
 
 DATA_DIR=/app/data
 SECRETS_DB_PATH=/app/secrets/secrets.db
@@ -78,11 +80,13 @@ Important notes:
 - `WEBHOOK_SECRET` must match the `WEBHOOK_SECRET` secret configured on the Cloudflare Worker.
 - `QUEUE_MASTER_KEY` is mandatory. Mailbridge uses it together with a random per-message secret stored in `secrets.db` to decrypt locally queued mail.
 - `MAILBRIDGE_PRIVATE_KEY_PATH` points to the private key Mailbridge uses to decrypt inbound mail that the Worker encrypted before storing in R2.
-- `RELAY_UPSTREAM_PROVIDER` accepts `sendgrid`, `resend`, or `mailgun`.
+- `RELAY_UPSTREAM_PROVIDER` accepts `sendgrid`, `resend`, `mailgun`, or `cloudflare`.
 - `RELAY_API_KEY` is the outbound API credential used for the selected provider.
 - `MAILGUN_DOMAIN` is required only when `RELAY_UPSTREAM_PROVIDER=mailgun`. If you use Mailgun EU, set `MAILGUN_BASE_URL=https://api.eu.mailgun.net`.
+- `CLOUDFLARE_SEND_WORKER_URL` is required when `RELAY_UPSTREAM_PROVIDER=cloudflare`. It should point to the Worker `fetch()` endpoint that calls the Cloudflare Email Service `EMAIL.send()` binding.
+- `CLOUDFLARE_SEND_WEBHOOK_SECRET` is required when `RELAY_UPSTREAM_PROVIDER=cloudflare`. If omitted, Mailbridge falls back to `WEBHOOK_SECRET`.
 - `SPAMHAUS_ENABLED=false` and `AI_ENABLED=false` in `.env.example` are intentional. Both controls are optional and must be enabled deliberately.
-- SMTP relay TLS is fail-closed by default. If you want to use the relay, set `SMTP_RELAY_TLS_CERT_FILE` and `SMTP_RELAY_TLS_KEY_FILE` before exposing or using port `2525`.
+- The outbound SMTP relay is disabled by default. If you want to use it, set `SMTP_RELAY_ENABLED=true`, then set `SMTP_RELAY_TLS_CERT_FILE` and `SMTP_RELAY_TLS_KEY_FILE` before exposing or using port `2525`.
 - Local mail delivery is TLS-first by default. If your local mail server does not support a verifiable TLS path yet, you must explicitly opt out with `LOCAL_MAIL_REQUIRE_TLS=false` and, if needed, `LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED=false`.
 - If `CLOUDFLARED_ENABLED=true`, the container starts `cloudflared` and requires `CLOUDFLARED_TUNNEL_TOKEN`.
 
@@ -119,7 +123,7 @@ services:
 
 The default compose file does not publish `2525/tcp`. This is intentional: the SMTP relay should only be exposed after you have configured TLS and narrowed the allowed CIDRs.
 
-If you need to expose the relay intentionally, use a local compose override:
+If you need to expose the relay intentionally, set `SMTP_RELAY_ENABLED=true` and use a local compose override:
 
 ```yaml
 services:
@@ -230,7 +234,8 @@ In Worker Settings -> Variables and Secrets, add:
 - Secret: `MAILBRIDGE_PUBLIC_KEY_PEM`
   - Value: the full contents of `secrets/mailbridge-r2-public.pem`
 - Variable: `NODE_APP_URL`
-  - Value: the public webhook URL, including the path
+  - Value: the public Mailbridge origin or full webhook URL
+  - Example: `https://mailbridge.example.com`
   - Example: `https://mailbridge.example.com/api/webhook/email`
 - Variable: `MAIL_STORE_ENCRYPTION_VERSION`
   - Value: `v1`
@@ -239,10 +244,15 @@ The Worker expects these bindings and variables:
 
 - `MAIL_STORE` for R2
 - `MAIL_QUEUE` for Cloudflare Queues
+- `EMAIL` for Cloudflare Email Service sending when `RELAY_UPSTREAM_PROVIDER=cloudflare`
 - `WEBHOOK_SECRET` for webhook authentication
 - `MAILBRIDGE_PUBLIC_KEY_PEM` for encrypting mail before R2 storage
 - `MAIL_STORE_ENCRYPTION_VERSION` for payload format versioning
 - `NODE_APP_URL` for the public Mailbridge webhook endpoint
+
+If `NODE_APP_URL` is only an origin, the Worker automatically posts to `/api/webhook/email`.
+
+For Cloudflare outbound delivery, add a `send_email` binding named `EMAIL` to the same Worker and set `CLOUDFLARE_SEND_WORKER_URL` to the Worker's `/api/send/email` endpoint. Mailbridge signs these send requests with `CLOUDFLARE_SEND_WEBHOOK_SECRET` or `WEBHOOK_SECRET`, and the Worker sends via `env.EMAIL.send(...)`.
 
 ### 5. Set up Email Routing
 
