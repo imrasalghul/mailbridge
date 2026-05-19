@@ -4,21 +4,72 @@ Mailbridge bridges Cloudflare Email Workers to a local mail server for inbound m
 
 ## Overview
 
-- Inbound flow: Sender -> Cloudflare Email Worker -> encrypted R2 object -> Cloudflare Queue -> Mailbridge webhook -> local mail server
-- Outbound flow: trusted SMTP client -> Mailbridge SMTP relay -> selected upstream provider API
+Mailbridge is designed for hybrid mail deployments where Cloudflare handles public inbound email routing while final mail delivery still happens on a private or local mail server.
+
+### Inbound flow
+
+```text
+Sender
+-> Cloudflare Email Routing / Email Worker
+-> encrypted R2 object
+-> Cloudflare Queue
+-> Mailbridge webhook
+-> SpamAssassin / optional reputation checks / optional AI checks
+-> local mail server
+```
+
+### Outbound flow
+
+```text
+Trusted SMTP client
+-> Mailbridge SMTP relay
+-> selected upstream provider API
+-> recipient
+```
+
+Supported outbound providers:
+
+- SendGrid
+- Resend
+- Mailgun
+- Cloudflare Email Service
 
 ## Key Features
 
-- Multi-layer inbound filtering with SpamAssassin and optional AI review
-- Optional Spamhaus sender-IP and sender-domain reputation checks
 - HTTP webhook intake for Cloudflare Email Workers
-- Optional SMTP relay for local systems that need to hand outbound mail to SendGrid, Resend, Mailgun, or Cloudflare Email Service
-- Encrypted file-backed retry queue for temporary local-mail and upstream provider failures
-- Audit-only SQLite storage at `data/mailbridge.db`
-- Separate queue-secrets storage at `secrets/secrets.db`
+- Cloudflare Queue based inbound delivery
+- Encrypted R2-backed inbound mail handoff
+- Local mail delivery to Exchange, Postfix, Haraka, Mailcow, or another SMTP server
+- Optional SMTP relay for trusted local systems
+- Outbound relay support for SendGrid, Resend, Mailgun, or Cloudflare Email Service
+- Multi-layer inbound filtering with SpamAssassin and optional AI review
+- Local SpamAssassin daemon mode or Postmark SpamCheck mode
+- Optional Spamhaus sender-IP and sender-domain reputation checks
+- Exchange-friendly spam headers and subject tagging
+- Encrypted file-backed retry queue for temporary delivery failures
+- Audit-only SQLite database at `data/mailbridge.db`
+- Separate queue-secrets database at `secrets/secrets.db`
 - Public-key encryption for mail stored in R2 so only Mailbridge can decrypt it
-- Exchange-friendly spam headers and subject tagging for inbound mail
 - Optional in-container `cloudflared` tunnel for publishing the webhook without directly exposing port `3090`
+
+## Repository Layout
+
+```text
+.
+├── Dockerfile
+├── docker-compose.yml
+├── entrypoint.sh
+├── worker.js
+├── server.js
+├── lib/
+├── test/
+├── .env.example
+└── README.md
+```
+
+`worker.js` is the Cloudflare Worker entrypoint.
+
+`server.js` is the Mailbridge Node.js service.
 
 ## Quick Start
 
@@ -28,43 +79,407 @@ Pull the published container:
 docker pull ghcr.io/imrasalghul/mailbridge
 ```
 
-Create your local config and runtime directories:
+Create local config and runtime directories:
 
 ```bash
 cp .env.example .env
 mkdir -p data/queue secrets
 ```
 
-Generate the local queue master key and place it in `.env`:
+Generate the local queue master key:
 
 ```bash
 openssl rand -base64 32 | tr -d '\n'
 ```
 
-Generate the Mailbridge private key used to decrypt R2-backed inbound mail:
-
-```bash
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out secrets/mailbridge-r2-private.pem
-openssl rsa -pubout -in secrets/mailbridge-r2-private.pem -out secrets/mailbridge-r2-public.pem
-```
-
-Set the base64 key as `QUEUE_MASTER_KEY=` in `.env`, keep the private key at the path configured by `MAILBRIDGE_PRIVATE_KEY_PATH`, and copy the public key contents into the Cloudflare Worker secret `MAILBRIDGE_PUBLIC_KEY_PEM`.
-
-## Local Configuration
-
-Review these settings before first start:
+Set the output as:
 
 ```dotenv
+QUEUE_MASTER_KEY=...
+```
+
+Generate the Mailbridge private/public key pair used for encrypted R2-backed inbound mail:
+
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+  -out secrets/mailbridge-r2-private.pem
+
+openssl rsa -pubout \
+  -in secrets/mailbridge-r2-private.pem \
+  -out secrets/mailbridge-r2-public.pem
+
+chmod 600 secrets/mailbridge-r2-private.pem
+```
+
+Keep the private key on the Mailbridge host only.
+
+Copy the public key into the Cloudflare Worker secret:
+
+```bash
+cat secrets/mailbridge-r2-public.pem
+```
+
+Set the copied value as:
+
+```text
+MAILBRIDGE_PUBLIC_KEY_PEM
+```
+
+## Bootstrap Configuration
+
+For a new deployment, the easiest setup path is:
+
+1. Export a few deployment-specific values.
+2. Generate local secrets and the R2 encryption key pair.
+3. Auto-write `.env`.
+4. Auto-write `wrangler.toml`.
+5. Upload Worker secrets with Wrangler.
+6. Deploy the Worker.
+7. Start Mailbridge.
+
+Do not commit `.env`, private keys, tunnel tokens, or live Worker secrets.
+
+### 1. Set deployment variables
+
+Run this from the Mailbridge repo root and edit the values for your environment:
+
+```bash
+export MAILBRIDGE_HOSTNAME="mailbridge.example.com"
+export WORKER_NAME="mailbridge-worker"
+export WORKER_SEND_URL="https://${WORKER_NAME}.example.workers.dev/api/send/email"
+
+export LOCAL_MAIL_HOST="mail.internal.example"
+export LOCAL_MAIL_PORT="25"
+
+export RELAY_UPSTREAM_PROVIDER="cloudflare"
+export RELAY_FROM_FALLBACK="postmaster@example.com"
+
+export SMTP_RELAY_ENABLED="false"
+export SMTP_RELAY_ALLOWED_CIDRS="127.0.0.1/32,::1/128"
+
+export CLOUDFLARED_ENABLED="false"
+export CLOUDFLARED_TUNNEL_TOKEN=""
+
+export R2_BUCKET_NAME="mailbridge-inbound"
+export QUEUE_NAME="mailbridge-inbound"
+```
+
+For a LAN relay, use something like:
+
+```bash
+export SMTP_RELAY_ENABLED="true"
+export SMTP_RELAY_ALLOWED_CIDRS="192.168.1.0/24,127.0.0.1/32"
+```
+
+If testing from Docker Desktop on macOS, the relay client may appear as `192.168.65.1`, so include:
+
+```bash
+export SMTP_RELAY_ALLOWED_CIDRS="192.168.1.0/24,192.168.65.0/24,127.0.0.1/32"
+```
+
+If the container runs `cloudflared`, set:
+
+```bash
+export CLOUDFLARED_ENABLED="true"
+export CLOUDFLARED_TUNNEL_TOKEN="your_tunnel_token"
+```
+
+If `cloudflared` runs as a host service instead, keep `CLOUDFLARED_ENABLED=false`.
+
+### 2. Generate secrets and write `.env`
+
+Run this from the Mailbridge repo root:
+
+```bash
+mkdir -p data/queue secrets
+
+export QUEUE_MASTER_KEY="${QUEUE_MASTER_KEY:-$(openssl rand -base64 32 | tr -d '\n')}"
+export WEBHOOK_SECRET="${WEBHOOK_SECRET:-$(openssl rand -base64 48 | tr -d '\n')}"
+export CLOUDFLARE_SEND_WEBHOOK_SECRET="${CLOUDFLARE_SEND_WEBHOOK_SECRET:-$(openssl rand -base64 48 | tr -d '\n')}"
+
+if [ ! -f secrets/mailbridge-r2-private.pem ]; then
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+    -out secrets/mailbridge-r2-private.pem
+
+  openssl rsa -pubout \
+    -in secrets/mailbridge-r2-private.pem \
+    -out secrets/mailbridge-r2-public.pem
+
+  chmod 600 secrets/mailbridge-r2-private.pem
+fi
+
+cat > .env <<EOF
+# Node App Configuration
+PORT=3090
+SMTP_RELAY_PORT=2525
+SMTP_RELAY_SOCKET_TIMEOUT_MS=120000
+MAILBRIDGE_VERBOSE_LOGGING=true
+MAILBRIDGE_HOSTNAME=${MAILBRIDGE_HOSTNAME}
+QUEUE_MAX_ATTEMPTS=20
+DATA_DIR=/app/data
+SECRETS_DB_PATH=/app/secrets/secrets.db
+QUEUE_MASTER_KEY=${QUEUE_MASTER_KEY}
+MAILBRIDGE_PRIVATE_KEY_PATH=/app/secrets/mailbridge-r2-private.pem
+AUDIT_LOG_RETENTION_DAYS=1
+
+# Optional in-container Cloudflare Tunnel
+CLOUDFLARED_ENABLED=${CLOUDFLARED_ENABLED}
+CLOUDFLARED_TUNNEL_TOKEN=${CLOUDFLARED_TUNNEL_TOKEN}
+CLOUDFLARED_LOGLEVEL=info
+
+# Security - must match the Worker secret WEBHOOK_SECRET
+WEBHOOK_SECRET=${WEBHOOK_SECRET}
+
+# Local Mail Server Configuration
+LOCAL_MAIL_HOST=${LOCAL_MAIL_HOST}
+LOCAL_MAIL_PORT=${LOCAL_MAIL_PORT}
+LOCAL_MAIL_SECURE=false
+LOCAL_MAIL_REQUIRE_TLS=false
+LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED=false
+LOCAL_MAIL_TLS_SERVERNAME=
+LOCAL_MAIL_TLS_CA_FILE=
+
+# Outbound Relay Provider Configuration
+RELAY_UPSTREAM_PROVIDER=${RELAY_UPSTREAM_PROVIDER}
+RELAY_API_KEY=
+RELAY_FROM_FALLBACK=${RELAY_FROM_FALLBACK}
+RESEND_BASE_URL=https://api.resend.com
+MAILGUN_DOMAIN=
+MAILGUN_BASE_URL=https://api.mailgun.net
+CLOUDFLARE_SEND_WORKER_URL=${WORKER_SEND_URL}
+CLOUDFLARE_SEND_WEBHOOK_SECRET=${CLOUDFLARE_SEND_WEBHOOK_SECRET}
+
+SMTP_RELAY_ENABLED=${SMTP_RELAY_ENABLED}
+SMTP_RELAY_VERBOSE_LOGGING=true
+SMTP_RELAY_INJECT_HEADERS=true
+SMTP_RELAY_REQUIRE_TLS=false
+SMTP_RELAY_ALLOW_INSECURE=false
+SMTP_RELAY_ALLOWED_CIDRS=${SMTP_RELAY_ALLOWED_CIDRS}
+SMTP_RELAY_TLS_CERT_FILE=
+SMTP_RELAY_TLS_KEY_FILE=
+SMTP_RELAY_TLS_CA_FILE=
+
+# SpamAssassin Config
+SPAMASSASSIN_MODE=local
+POSTMARK_SPAMCHECK_URL=https://spamcheck.postmarkapp.com/filter
+SPAMD_HOST=127.0.0.1
+SPAMD_PORT=783
+SPAMD_STARTUP_ATTEMPTS=30
+SPAMC_TIMEOUT_MS=10000
+SPAMC_FAIL_OPEN=false
+SA_BLOCK_THRESHOLD=12
+SA_QUESTIONABLE_THRESHOLD=5
+SPAM_SCL_SCORE=9
+SPAM_SUBJECT_TAG=[SPAM]
+
+# Optional Spamhaus Intelligence API checks
+SPAMHAUS_ENABLED=false
+SPAMHAUS_USERNAME=
+SPAMHAUS_PASSWORD=
+SPAMHAUS_FAIL_OPEN=true
+
+# Optional AI secondary screening
+AI_ENABLED=false
+AI_API_KEY=
+AI_MODEL=gpt-5.4-nano
+AI_BASE_URL=
+AI_INPUT_SCOPE=headers
+AI_MAX_INPUT_CHARS=20000
+EOF
+
+echo
+echo "Generated .env"
+echo
+echo "Worker secrets to upload:"
+echo "WEBHOOK_SECRET=${WEBHOOK_SECRET}"
+echo "CLOUDFLARE_SEND_WEBHOOK_SECRET=${CLOUDFLARE_SEND_WEBHOOK_SECRET}"
+echo
+echo "MAILBRIDGE_PUBLIC_KEY_PEM:"
+cat secrets/mailbridge-r2-public.pem
+```
+
+### 3. Write `wrangler.toml`
+
+Run this from the Mailbridge repo root:
+
+```bash
+cat > wrangler.toml <<EOF
+name = "${WORKER_NAME}"
+main = "worker.js"
+compatibility_date = "2026-05-19"
+preview_urls = false
+
+[vars]
+NODE_APP_URL = "https://${MAILBRIDGE_HOSTNAME}/api/webhook/email"
+MAIL_STORE_ENCRYPTION_VERSION = "v1"
+
+[[r2_buckets]]
+binding = "MAIL_STORE"
+bucket_name = "${R2_BUCKET_NAME}"
+
+[[queues.producers]]
+binding = "MAIL_QUEUE"
+queue = "${QUEUE_NAME}"
+
+[[queues.consumers]]
+queue = "${QUEUE_NAME}"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3
+
+[[send_email]]
+name = "EMAIL"
+EOF
+```
+
+The `[[send_email]]` block must be top-level. Do not put `send_email = [...]` inside `[[queues.consumers]]`.
+
+### 4. Upload Worker secrets
+
+Run:
+
+```bash
+printf '%s' "$WEBHOOK_SECRET" | npx wrangler secret put WEBHOOK_SECRET --name "$WORKER_NAME"
+
+printf '%s' "$CLOUDFLARE_SEND_WEBHOOK_SECRET" | npx wrangler secret put CLOUDFLARE_SEND_WEBHOOK_SECRET --name "$WORKER_NAME"
+
+cat secrets/mailbridge-r2-public.pem | npx wrangler secret put MAILBRIDGE_PUBLIC_KEY_PEM --name "$WORKER_NAME"
+```
+
+### 5. Create Cloudflare resources and deploy
+
+Run:
+
+```bash
+npx wrangler r2 bucket create "$R2_BUCKET_NAME" || true
+npx wrangler queues create "$QUEUE_NAME" || true
+npx wrangler deploy
+```
+
+After deploy, Wrangler should show bindings similar to:
+
+```text
+env.MAIL_QUEUE
+env.MAIL_STORE
+env.NODE_APP_URL
+env.MAIL_STORE_ENCRYPTION_VERSION
+env.EMAIL
+```
+
+If `env.EMAIL` is missing, check that `wrangler.toml` contains:
+
+```toml
+[[send_email]]
+name = "EMAIL"
+```
+
+### 6. Start Mailbridge
+
+Run:
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker logs -f mail-bridge
+```
+
+If using the SMTP relay, make sure port `2525` is published in your local compose override:
+
+```yaml
+services:
+  mail-bridge:
+    ports:
+      - "3090:3090"
+      - "2525:2525"
+```
+
+### 7. Test inbound
+
+Send an email to an address routed to the Cloudflare Worker.
+
+Watch logs:
+
+```bash
+docker logs -f mail-bridge
+```
+
+Successful inbound delivery looks like:
+
+```text
+[Webhook] Inbound payload accepted ...
+[SpamAssassin] Score resolved ...
+[Webhook] Injected inbound local-mail headers ...
+Direct delivery successful.
+```
+
+### 8. Test outbound relay
+
+If `SMTP_RELAY_ENABLED=true`, test with `swaks`:
+
+```bash
+swaks \
+  --server 127.0.0.1 \
+  --port 2525 \
+  --from postmaster@example.com \
+  --to recipient@example.net \
+  --header "Subject: Mailbridge outbound test" \
+  --body "This is an outbound relay test through Mailbridge."
+```
+
+Successful SMTP relay acceptance looks like:
+
+```text
+MAIL FROM accepted
+RCPT accepted
+Received message from local relay client
+```
+
+If the upstream provider is unavailable, Mailbridge queues the message for retry.
+
+## Local Configuration Reference
+
+Review `.env.example` before first start.
+
+Minimal inbound-only example:
+
+```dotenv
+PORT=3090
 MAILBRIDGE_HOSTNAME=mailbridge.example.com
 WEBHOOK_SECRET=replace_with_a_shared_secret
 
 LOCAL_MAIL_HOST=mail.internal.example
 LOCAL_MAIL_PORT=25
+LOCAL_MAIL_REQUIRE_TLS=true
+LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED=true
 
-RELAY_UPSTREAM_PROVIDER=sendgrid
-RELAY_API_KEY=replace_with_provider_api_key
-RELAY_FROM_FALLBACK=relay@example.com
-MAILGUN_DOMAIN=mg.example.com
+DATA_DIR=/app/data
+SECRETS_DB_PATH=/app/secrets/secrets.db
+QUEUE_MASTER_KEY=replace_with_a_base64_32_byte_value
+MAILBRIDGE_PRIVATE_KEY_PATH=/app/secrets/mailbridge-r2-private.pem
+AUDIT_LOG_RETENTION_DAYS=1
+
+SPAMASSASSIN_MODE=local
+SPAMHAUS_ENABLED=false
+AI_ENABLED=false
+
+SMTP_RELAY_ENABLED=false
+```
+
+Example with Cloudflare outbound relay enabled:
+
+```dotenv
+PORT=3090
+MAILBRIDGE_HOSTNAME=mailbridge.example.com
+WEBHOOK_SECRET=replace_with_a_shared_secret
+
+LOCAL_MAIL_HOST=mail.internal.example
+LOCAL_MAIL_PORT=25
+LOCAL_MAIL_REQUIRE_TLS=false
+LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED=false
+
+RELAY_UPSTREAM_PROVIDER=cloudflare
+RELAY_API_KEY=
+RELAY_FROM_FALLBACK=postmaster@example.com
 CLOUDFLARE_SEND_WORKER_URL=https://mailbridge-worker.example.workers.dev/api/send/email
 CLOUDFLARE_SEND_WEBHOOK_SECRET=replace_with_worker_send_secret
 
@@ -73,44 +488,227 @@ SECRETS_DB_PATH=/app/secrets/secrets.db
 QUEUE_MASTER_KEY=replace_with_a_base64_32_byte_value
 MAILBRIDGE_PRIVATE_KEY_PATH=/app/secrets/mailbridge-r2-private.pem
 AUDIT_LOG_RETENTION_DAYS=1
+
+SMTP_RELAY_ENABLED=true
+SMTP_RELAY_PORT=2525
+SMTP_RELAY_REQUIRE_TLS=false
+SMTP_RELAY_ALLOWED_CIDRS=127.0.0.1/32,::1/128
+
+SPAMASSASSIN_MODE=local
+SPAMHAUS_ENABLED=false
+AI_ENABLED=false
 ```
 
-Important notes:
+## Important Environment Variables
 
-- `WEBHOOK_SECRET` must match the `WEBHOOK_SECRET` secret configured on the Cloudflare Worker.
-- `QUEUE_MASTER_KEY` is mandatory. Mailbridge uses it together with a random per-message secret stored in `secrets.db` to decrypt locally queued mail.
-- `MAILBRIDGE_PRIVATE_KEY_PATH` points to the private key Mailbridge uses to decrypt inbound mail that the Worker encrypted before storing in R2.
-- `RELAY_UPSTREAM_PROVIDER` accepts `sendgrid`, `resend`, `mailgun`, or `cloudflare`.
-- `RELAY_API_KEY` is the outbound API credential used for the selected provider.
-- `MAILGUN_DOMAIN` is required only when `RELAY_UPSTREAM_PROVIDER=mailgun`. If you use Mailgun EU, set `MAILGUN_BASE_URL=https://api.eu.mailgun.net`.
-- `CLOUDFLARE_SEND_WORKER_URL` is required when `RELAY_UPSTREAM_PROVIDER=cloudflare`. It should point to the Worker `fetch()` endpoint that calls the Cloudflare Email Service `EMAIL.send()` binding.
-- `CLOUDFLARE_SEND_WEBHOOK_SECRET` is required when `RELAY_UPSTREAM_PROVIDER=cloudflare`. If omitted, Mailbridge falls back to `WEBHOOK_SECRET`.
-- `SPAMASSASSIN_MODE=local` starts the in-container `spamd` daemon. Set `SPAMASSASSIN_MODE=postmark` to use Postmark SpamCheck instead and skip the local daemon.
-- `SPAMHAUS_ENABLED=false` and `AI_ENABLED=false` in `.env.example` are intentional. Both controls are optional and must be enabled deliberately.
-- The outbound SMTP relay is disabled by default. If you want to use it, set `SMTP_RELAY_ENABLED=true`, then set `SMTP_RELAY_TLS_CERT_FILE` and `SMTP_RELAY_TLS_KEY_FILE` before exposing or using port `2525`.
-- Local mail delivery is TLS-first by default. If your local mail server does not support a verifiable TLS path yet, you must explicitly opt out with `LOCAL_MAIL_REQUIRE_TLS=false` and, if needed, `LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED=false`.
-- If `CLOUDFLARED_ENABLED=true`, the container starts `cloudflared` and requires `CLOUDFLARED_TUNNEL_TOKEN`.
+### Core
+
+| Variable | Purpose |
+|---|---|
+| `PORT` | HTTP listener port. Default is `3090`. |
+| `MAILBRIDGE_HOSTNAME` | Public hostname for this Mailbridge instance. |
+| `WEBHOOK_SECRET` | Shared secret required on inbound Worker webhook requests. |
+| `DATA_DIR` | Runtime data directory. |
+| `SECRETS_DB_PATH` | SQLite DB path for queue secret material. |
+| `QUEUE_MASTER_KEY` | Base64 master key for encrypted local retry queue. |
+| `MAILBRIDGE_PRIVATE_KEY_PATH` | Private key used to decrypt Worker-encrypted R2 payloads. |
+| `AUDIT_LOG_RETENTION_DAYS` | Retention period for audit records. |
+
+### Local mail delivery
+
+| Variable | Purpose |
+|---|---|
+| `LOCAL_MAIL_HOST` | SMTP server that receives inbound mail from Mailbridge. |
+| `LOCAL_MAIL_PORT` | SMTP port for local delivery, usually `25`. |
+| `LOCAL_MAIL_SECURE` | Use implicit TLS for local delivery. |
+| `LOCAL_MAIL_REQUIRE_TLS` | Require STARTTLS before local delivery. |
+| `LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED` | Enforce TLS certificate validation. |
+| `LOCAL_MAIL_TLS_SERVERNAME` | Optional SNI/servername override. Useful when `LOCAL_MAIL_HOST` is an IP. |
+| `LOCAL_MAIL_TLS_CA_FILE` | Optional CA file for internal certificates. |
+
+For production, prefer verified TLS:
+
+```dotenv
+LOCAL_MAIL_REQUIRE_TLS=true
+LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED=true
+```
+
+For initial lab testing against an internal SMTP server, you may explicitly opt out:
+
+```dotenv
+LOCAL_MAIL_REQUIRE_TLS=false
+LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED=false
+```
+
+### Outbound relay
+
+| Variable | Purpose |
+|---|---|
+| `SMTP_RELAY_ENABLED` | Enables Mailbridge SMTP relay listener. |
+| `SMTP_RELAY_PORT` | SMTP relay port, usually `2525`. |
+| `SMTP_RELAY_REQUIRE_TLS` | Requires STARTTLS before accepting relay mail. |
+| `SMTP_RELAY_ALLOWED_CIDRS` | Allowed client source networks. |
+| `SMTP_RELAY_TLS_CERT_FILE` | TLS certificate for SMTP relay. |
+| `SMTP_RELAY_TLS_KEY_FILE` | TLS private key for SMTP relay. |
+| `SMTP_RELAY_TLS_CA_FILE` | Optional CA file. |
+| `SMTP_RELAY_VERBOSE_LOGGING` | Enables verbose SMTP relay logs. |
+| `SMTP_RELAY_INJECT_HEADERS` | Adds relay diagnostic headers. |
+
+Example LAN-only relay:
+
+```dotenv
+SMTP_RELAY_ENABLED=true
+SMTP_RELAY_PORT=2525
+SMTP_RELAY_REQUIRE_TLS=false
+SMTP_RELAY_ALLOWED_CIDRS=192.168.1.0/24,127.0.0.1/32
+```
+
+If you test from Docker Desktop on macOS, the container may see host connections from a Docker Desktop bridge address such as `192.168.65.1`. In that case, include the Docker Desktop subnet:
+
+```dotenv
+SMTP_RELAY_ALLOWED_CIDRS=192.168.1.0/24,192.168.65.0/24,127.0.0.1/32
+```
+
+Do not expose the SMTP relay to the public internet.
+
+### Provider selection
+
+| Variable | Purpose |
+|---|---|
+| `RELAY_UPSTREAM_PROVIDER` | `sendgrid`, `resend`, `mailgun`, or `cloudflare`. |
+| `RELAY_API_KEY` | API key for SendGrid, Resend, or Mailgun. |
+| `RELAY_FROM_FALLBACK` | Fallback sender address. |
+| `RESEND_BASE_URL` | Resend API base URL. |
+| `MAILGUN_DOMAIN` | Required for Mailgun. |
+| `MAILGUN_BASE_URL` | Mailgun API base URL. |
+| `CLOUDFLARE_SEND_WORKER_URL` | Worker `/api/send/email` endpoint for Cloudflare Email Service. |
+| `CLOUDFLARE_SEND_WEBHOOK_SECRET` | Secret used to authenticate Mailbridge to the Worker send endpoint. |
+
+Cloudflare outbound example:
+
+```dotenv
+RELAY_UPSTREAM_PROVIDER=cloudflare
+CLOUDFLARE_SEND_WORKER_URL=https://mailbridge-worker.example.workers.dev/api/send/email
+CLOUDFLARE_SEND_WEBHOOK_SECRET=replace_with_worker_send_secret
+```
+
+If using a custom Worker hostname, make sure it resolves from inside the container. If it does not, use the deployed `workers.dev` URL until DNS is fixed.
+
+### Cloudflare Tunnel
+
+Mailbridge can optionally start `cloudflared` from the container entrypoint.
+
+```dotenv
+CLOUDFLARED_ENABLED=true
+CLOUDFLARED_TUNNEL_TOKEN=your_tunnel_token
+CLOUDFLARED_LOGLEVEL=info
+```
+
+If you run `cloudflared` as a host service instead, keep this disabled:
+
+```dotenv
+CLOUDFLARED_ENABLED=false
+CLOUDFLARED_TUNNEL_TOKEN=
+```
+
+Do not run both the host service and in-container tunnel for the same hostname unless you intentionally want multiple connectors.
+
+### SpamAssassin
+
+Local SpamAssassin mode:
+
+```dotenv
+SPAMASSASSIN_MODE=local
+SPAMD_HOST=127.0.0.1
+SPAMD_PORT=783
+SPAMD_STARTUP_ATTEMPTS=30
+SPAMC_TIMEOUT_MS=10000
+SPAMC_FAIL_OPEN=false
+SA_BLOCK_THRESHOLD=12
+SA_QUESTIONABLE_THRESHOLD=5
+SPAM_SCL_SCORE=9
+SPAM_SUBJECT_TAG=[SPAM]
+```
+
+Postmark SpamCheck mode:
+
+```dotenv
+SPAMASSASSIN_MODE=postmark
+POSTMARK_SPAMCHECK_URL=https://spamcheck.postmarkapp.com/filter
+```
+
+In local mode, the container starts `spamd` and Mailbridge sends a protocol `CHECK` request. Successful replies use `0 EX_OK` and include a `Spam: True|False ; score / threshold` header. Scores are parsed as signed real numbers, so legitimate negative ham scores are handled correctly.
+
+In Postmark mode, Mailbridge sends the raw message to the SpamCheck API with `options=short` and uses the returned SpamAssassin score. The container skips starting local `spamd` in this mode.
+
+### Spamhaus
+
+Spamhaus checks are optional and disabled by default:
+
+```dotenv
+SPAMHAUS_ENABLED=false
+SPAMHAUS_USERNAME=
+SPAMHAUS_PASSWORD=
+SPAMHAUS_FAIL_OPEN=true
+```
+
+When enabled, Mailbridge checks the original sender IP from the decrypted Worker payload, not the Cloudflare request IP.
+
+### AI screening
+
+AI scanning is optional and disabled by default:
+
+```dotenv
+AI_ENABLED=false
+AI_API_KEY=
+AI_MODEL=gpt-5.4-nano
+AI_BASE_URL=
+AI_INPUT_SCOPE=headers
+AI_MAX_INPUT_CHARS=20000
+```
+
+Available input scopes:
+
+- `headers`
+- `attachments`
+- `full_email`
+
+`attachments` sends headers plus attachment filenames only. It does not send attachment contents.
+
+When AI scanning runs, Mailbridge expects structured JSON:
+
+```json
+{
+  "spam": 0,
+  "reason": "not_spam",
+  "score": 0
+}
+```
+
+`score=9` means highly likely spam. `score=0` means not likely spam.
 
 ## Docker Startup
 
 ### Docker Compose
 
-The default compose file mounts both `./data` and `./secrets` into the container and publishes only the webhook port:
+The default compose file mounts both `./data` and `./secrets` into the container and publishes the configured ports:
 
 ```bash
 docker compose up -d --build
 ```
 
-Runtime layout inside the mounted volumes:
+Runtime layout inside mounted volumes:
 
-- `data/mailbridge.db`
-- `data/queue/<queue-id>.eml`
-- `secrets/secrets.db`
-- `secrets/mailbridge-r2-private.pem`
+```text
+data/mailbridge.db
+data/queue/<queue-id>.eml
+secrets/secrets.db
+secrets/mailbridge-r2-private.pem
+```
 
 `data/queue/*.eml` files are encrypted at rest. They are created only for messages that enter the retry queue. Messages delivered immediately stay in memory and are not written to disk as queue files.
 
-The default compose file uses `./secrets:/app/secrets` for convenience. For production, change the host side to a different location than `./data`, ideally a separate encrypted disk, secret-backed mount, or another protected path.
+For production, store `secrets/` somewhere more protected than the app directory, ideally a separate encrypted disk, secret-backed mount, or protected host path.
 
 Example hardened override:
 
@@ -122,9 +720,7 @@ services:
       - "/srv/mailbridge-secrets:/app/secrets"
 ```
 
-The default compose file does not publish `2525/tcp`. This is intentional: the SMTP relay should only be exposed after you have configured TLS and narrowed the allowed CIDRs.
-
-If you need to expose the relay intentionally, set `SMTP_RELAY_ENABLED=true` and use a local compose override:
+If you need to expose the relay intentionally, use a local compose override:
 
 ```yaml
 services:
@@ -134,9 +730,17 @@ services:
       - "2525:2525"
 ```
 
-If you are using the built-in Cloudflare Tunnel, `3090` does not need to be publicly reachable. You can remove the `3090:3090` port mapping or bind it to localhost only in your own compose override.
+If you use Cloudflare Tunnel, `3090` does not need to be publicly reachable. You can bind it to localhost only:
 
-If your local mail server is only reachable through a fixed IP and not normal DNS, add an `extra_hosts` entry in your local compose override instead of editing the default compose file:
+```yaml
+services:
+  mail-bridge:
+    ports:
+      - "127.0.0.1:3090:3090"
+      - "2525:2525"
+```
+
+If your local mail server is reachable only through a fixed IP, add an `extra_hosts` entry in a local compose override instead of editing the default compose file:
 
 ```yaml
 services:
@@ -146,8 +750,6 @@ services:
 ```
 
 ### Docker Run
-
-If you prefer to run the published image directly:
 
 ```bash
 docker run \
@@ -160,18 +762,28 @@ docker run \
   ghcr.io/imrasalghul/mailbridge
 ```
 
-For production, replace `$PWD/secrets` with a different host path than `$PWD/data`.
+If you need the SMTP relay:
+
+```bash
+docker run \
+  --name mail-bridge \
+  --restart unless-stopped \
+  --env-file .env \
+  -v "$PWD/data:/app/data" \
+  -v "$PWD/secrets:/app/secrets" \
+  -p 3090:3090 \
+  -p 2525:2525 \
+  ghcr.io/imrasalghul/mailbridge
+```
 
 ## Run From Source
 
-If you run Mailbridge from source instead of the container:
-
 1. Copy `.env.example` to `.env`.
-2. Set `DATA_DIR=./data` in `.env`.
-3. Set `SECRETS_DB_PATH=./secrets/secrets.db` in `.env`.
+2. Set `DATA_DIR=./data`.
+3. Set `SECRETS_DB_PATH=./secrets/secrets.db`.
 4. Generate and set `QUEUE_MASTER_KEY`.
-5. Generate the Mailbridge private key and place it under `./secrets`.
-6. Create the runtime directories:
+5. Generate the Mailbridge private/public key pair.
+6. Create runtime directories:
 
 ```bash
 mkdir -p data/queue secrets
@@ -186,93 +798,255 @@ npm start
 
 Source mode uses the same runtime layout:
 
-- `data/mailbridge.db`
-- `data/queue/<queue-id>.eml`
-- `secrets/secrets.db`
-- `secrets/mailbridge-r2-private.pem`
+```text
+data/mailbridge.db
+data/queue/<queue-id>.eml
+secrets/secrets.db
+secrets/mailbridge-r2-private.pem
+```
+
+## Cloudflare Worker Setup
+
+This project includes `worker.js`, which handles:
+
+- Cloudflare Email Routing `email()` events
+- R2 encrypted object storage
+- Queue producer and consumer flow
+- Webhook delivery to Mailbridge
+- Optional Cloudflare Email Service outbound sending through `fetch()`
+
+You can configure Cloudflare manually in the dashboard or with Wrangler.
+
+## Wrangler Configuration
+
+A safe public-repo `wrangler.toml` example:
+
+```toml
+name = "mailbridge-worker"
+main = "worker.js"
+compatibility_date = "2026-05-19"
+preview_urls = false
+
+[vars]
+NODE_APP_URL = "https://mailbridge.example.com/api/webhook/email"
+MAIL_STORE_ENCRYPTION_VERSION = "v1"
+
+[[r2_buckets]]
+binding = "MAIL_STORE"
+bucket_name = "mailbridge-inbound"
+
+[[queues.producers]]
+binding = "MAIL_QUEUE"
+queue = "mailbridge-inbound"
+
+[[queues.consumers]]
+queue = "mailbridge-inbound"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3
+
+[[send_email]]
+name = "EMAIL"
+```
+
+The `[[send_email]]` block must be top-level. Do not put `send_email = [...]` inside a queue consumer block.
+
+For a public repository, do not commit:
+
+- account IDs
+- tunnel tokens
+- API tokens
+- private keys
+- live webhook secrets
+- live Worker send secrets
+- live `.env`
+
+## Cloudflare Worker Secrets
+
+Required secrets:
+
+```text
+WEBHOOK_SECRET
+MAILBRIDGE_PUBLIC_KEY_PEM
+```
+
+Required only for Cloudflare outbound relay:
+
+```text
+CLOUDFLARE_SEND_WEBHOOK_SECRET
+```
+
+Set them with Wrangler:
+
+```bash
+npx wrangler secret put WEBHOOK_SECRET
+npx wrangler secret put MAILBRIDGE_PUBLIC_KEY_PEM
+npx wrangler secret put CLOUDFLARE_SEND_WEBHOOK_SECRET
+```
+
+`MAILBRIDGE_PUBLIC_KEY_PEM` should be the full contents of:
+
+```bash
+cat secrets/mailbridge-r2-public.pem
+```
+
+Include:
+
+```text
+-----BEGIN PUBLIC KEY-----
+...
+-----END PUBLIC KEY-----
+```
+
+## Cloudflare Resources
+
+### R2 bucket
+
+Create a private R2 bucket, for example:
+
+```text
+mailbridge-inbound
+```
+
+Worker binding:
+
+```text
+MAIL_STORE
+```
+
+The Worker stores encrypted ciphertext in this bucket, not plaintext raw mail.
+
+### Queue
+
+Create a queue, for example:
+
+```text
+mailbridge-inbound
+```
+
+Worker producer binding:
+
+```text
+MAIL_QUEUE
+```
+
+Attach the same Worker as the consumer.
+
+Recommended starting consumer settings:
+
+```text
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3
+dead-letter queue = optional
+```
+
+### Email Service binding
+
+If using Cloudflare Email Service for outbound relay, add a send email binding named:
+
+```text
+EMAIL
+```
+
+Wrangler syntax:
+
+```toml
+[[send_email]]
+name = "EMAIL"
+```
+
+Mailbridge sends outbound requests to:
+
+```text
+CLOUDFLARE_SEND_WORKER_URL
+```
+
+The Worker verifies the send secret and sends through:
+
+```js
+env.EMAIL.send(...)
+```
 
 ## Cloudflare Dashboard Setup
 
-This project includes a ready-to-paste Worker script in [`worker.js`](./worker.js). The Cloudflare side should be created in the dashboard with that file as the Worker code.
-
 ### 1. Create the Worker
 
-1. In Cloudflare, open Workers & Pages.
-2. Create a new Worker.
-3. Replace the default code with the contents of [`worker.js`](./worker.js).
-4. Deploy the Worker once so bindings and secrets can be attached.
+1. Open Cloudflare Workers & Pages.
+2. Create a Worker.
+3. Replace the default code with `worker.js`.
+4. Deploy once so bindings and secrets can be attached.
 
-### 2. Create the R2 bucket
+### 2. Add R2 binding
 
-1. Open R2 in the Cloudflare dashboard.
-2. Create a private bucket for inbound mail, for example `mailbridge-inbound`.
-3. Go back to the Worker and add an R2 binding:
-   - Binding name: `MAIL_STORE`
-   - Bucket: the bucket you just created
+Binding name:
 
-The Worker now stores ciphertext in this bucket, not plaintext raw mail.
+```text
+MAIL_STORE
+```
 
-### 3. Create the Queue
+Bucket example:
 
-1. Open Queues in the Cloudflare dashboard.
-2. Create a queue for inbound delivery, for example `mailbridge-inbound`.
-3. In the Worker settings, add a queue producer binding:
-   - Binding name: `MAIL_QUEUE`
-   - Queue: the queue you just created
-4. Attach the same Worker as the queue consumer for that queue.
-5. Use the default consumer settings for this release:
-   - `max_batch_size=10`
-   - `max_batch_timeout=5`
-   - `max_retries=3`
-   - no dead-letter queue
+```text
+mailbridge-inbound
+```
 
-### 4. Add Worker variables and secrets
+### 3. Add Queue binding
 
-In Worker Settings -> Variables and Secrets, add:
+Producer binding name:
 
-- Secret: `WEBHOOK_SECRET`
-  - Value: exactly the same value you put in Mailbridge `.env`
-- Secret: `MAILBRIDGE_PUBLIC_KEY_PEM`
-  - Value: the full contents of `secrets/mailbridge-r2-public.pem`
-- Variable: `NODE_APP_URL`
-  - Value: the public Mailbridge origin or full webhook URL
-  - Example: `https://mailbridge.example.com`
-  - Example: `https://mailbridge.example.com/api/webhook/email`
-- Variable: `MAIL_STORE_ENCRYPTION_VERSION`
-  - Value: `v1`
+```text
+MAIL_QUEUE
+```
 
-The Worker expects these bindings and variables:
+Queue example:
 
-- `MAIL_STORE` for R2
-- `MAIL_QUEUE` for Cloudflare Queues
-- `EMAIL` for Cloudflare Email Service sending when `RELAY_UPSTREAM_PROVIDER=cloudflare`
-- `WEBHOOK_SECRET` for webhook authentication
-- `MAILBRIDGE_PUBLIC_KEY_PEM` for encrypting mail before R2 storage
-- `MAIL_STORE_ENCRYPTION_VERSION` for payload format versioning
-- `NODE_APP_URL` for the public Mailbridge webhook endpoint
+```text
+mailbridge-inbound
+```
 
-If `NODE_APP_URL` is only an origin, the Worker automatically posts to `/api/webhook/email`.
+Attach the same Worker as the queue consumer.
 
-For Cloudflare outbound delivery, add a `send_email` binding named `EMAIL` to the same Worker and set `CLOUDFLARE_SEND_WORKER_URL` to the Worker's `/api/send/email` endpoint. Mailbridge signs these send requests with `CLOUDFLARE_SEND_WEBHOOK_SECRET` or `WEBHOOK_SECRET`, and the Worker sends via `env.EMAIL.send(...)`.
+### 4. Add variables
 
-### 5. Set up Email Routing
+```text
+NODE_APP_URL=https://mailbridge.example.com/api/webhook/email
+MAIL_STORE_ENCRYPTION_VERSION=v1
+```
 
-1. Open Email Routing in the Cloudflare dashboard.
-2. Create or edit the route for the address you want Cloudflare to send into Mailbridge.
-3. Choose the Worker you created above as the destination for that route.
+If `NODE_APP_URL` is only an origin, the Worker may append `/api/webhook/email` depending on implementation.
 
-This sends inbound mail into the Worker `email()` handler, which encrypts the message, stores it in R2, and enqueues an opaque object reference for delivery to Mailbridge.
+### 5. Add secrets
 
-### 6. Set up the Tunnel
+```text
+WEBHOOK_SECRET
+MAILBRIDGE_PUBLIC_KEY_PEM
+CLOUDFLARE_SEND_WEBHOOK_SECRET
+```
 
-If you want this container to run `cloudflared` itself:
+### 6. Set up Email Routing
 
-1. In Cloudflare, open Networking -> Tunnels.
+1. Open Cloudflare Email Routing.
+2. Create or edit a route for the desired address.
+3. Choose the Worker as the destination.
+
+This sends inbound mail into the Worker `email()` handler, which encrypts the message, stores it in R2, and enqueues an object reference for Mailbridge delivery.
+
+### 7. Set up Tunnel
+
+If the container runs `cloudflared`:
+
+1. Open Cloudflare Zero Trust / Tunnels.
 2. Create a tunnel.
 3. Add a public hostname for Mailbridge.
-4. Point that hostname to `http://localhost:3090`.
-5. Copy the tunnel token from the dashboard.
-6. Set these values in `.env`:
+4. Point it to:
+
+```text
+http://localhost:3090
+```
+
+5. Copy the tunnel token.
+6. Set:
 
 ```dotenv
 CLOUDFLARED_ENABLED=true
@@ -282,171 +1056,288 @@ CLOUDFLARED_LOGLEVEL=info
 
 7. Restart the container.
 
-Mailbridge starts `cloudflared tunnel --no-autoupdate run --token ...` from the main entrypoint when enabled.
+If running `cloudflared` as a host service instead, keep the Mailbridge container tunnel disabled.
 
-## Local Mail Server Example
+## Testing
 
-If you are using Exchange, point the inbound destination at your Exchange host with `LOCAL_MAIL_HOST` and `LOCAL_MAIL_PORT`.
+### Test local webhook
 
-If you plan to send outbound mail through Mailbridge from Exchange or another local system, point that system at the Mailbridge host on `SMTP_RELAY_PORT` after you have configured relay TLS and CIDR allowlisting.
-
-## Hardening
-
-### Local Mail TLS
-
-Mailbridge uses a verified TLS path to the local mail server by default:
-
-- `LOCAL_MAIL_REQUIRE_TLS=true` requires STARTTLS on non-implicit TLS connections
-- `LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED=true` enforces certificate verification
-- `LOCAL_MAIL_TLS_CA_FILE` lets you trust an internal CA instead of disabling verification
-
-This is the recommended production posture. If your local mail server still uses plaintext or an untrusted certificate, you must opt out explicitly instead of Mailbridge silently falling back.
-
-### SMTP Relay TLS and Network Restrictions
-
-The SMTP relay is designed to be locked down before use:
-
-- `SMTP_RELAY_REQUIRE_TLS=true` requires STARTTLS before mail submission
-- `SMTP_RELAY_ALLOWED_CIDRS` limits which source networks may connect
-- `SMTP_RELAY_TLS_CERT_FILE` and `SMTP_RELAY_TLS_KEY_FILE` must be set before secure relay use
-- the default compose file does not publish `2525`
-
-This means the relay is not meant to be a general plaintext LAN service anymore. If you need a temporary lab-only exception, use explicit opt-out settings instead of relying on old defaults.
-
-### Upstream Provider Selection
-
-Outbound relay delivery is provider-selectable:
-
-```dotenv
-RELAY_UPSTREAM_PROVIDER=sendgrid
-RELAY_API_KEY=...
-RELAY_FROM_FALLBACK=relay@example.com
+```bash
+curl -i http://127.0.0.1:3090/api/webhook/email
 ```
 
-Supported values:
+A `401`, `403`, `405`, or validation response is acceptable. Connection refused means Mailbridge is not listening.
 
-- `sendgrid`
-- `resend`
-- `mailgun`
+### Test public webhook through tunnel
 
-Provider notes:
-
-- `sendgrid`: uses the SendGrid Mail Send API
-- `resend`: uses the Resend send email API
-- `mailgun`: uses the Mailgun MIME send API and also requires `MAILGUN_DOMAIN`
-
-### Queued Message Encryption and Secret Separation
-
-Queued mail is encrypted at rest:
-
-- only messages that enter the retry queue are written into `data/queue/*.eml`
-- each queued file is encrypted with a key derived from `QUEUE_MASTER_KEY` plus a random per-message secret stored in `secrets.db`
-- leaking only the queue file or only `secrets.db` is not enough to decrypt queued mail
-
-`data/mailbridge.db` is audit-only. Active queue secrets live in `secrets/secrets.db`.
-
-For stronger separation, store `data/` and `secrets/` on different host paths. In production, prefer putting `secrets/` on a different encrypted disk or secret-backed mount.
-
-### Encrypted R2 Storage
-
-Inbound mail stored in R2 is encrypted before it is written:
-
-- the Worker only has the Mailbridge public key
-- the Worker stores ciphertext in R2 and forwards ciphertext to Mailbridge
-- only Mailbridge has the private key and can decrypt the message before spam checks, AI checks, and local delivery
-
-This means Cloudflare stores encrypted mail objects instead of plaintext raw messages. During rollout, legacy plaintext R2 objects can still be processed until the old backlog drains.
-
-### SpamAssassin Scoring Mode
-
-Mailbridge uses local SpamAssassin by default:
-
-```dotenv
-SPAMASSASSIN_MODE=local
+```bash
+curl -i https://mailbridge.example.com/api/webhook/email
 ```
 
-In local mode, the container starts `spamd` and Mailbridge sends a protocol `CHECK` request. Per the `spamd` protocol, successful replies use `0 EX_OK` and include a `Spam: True|False ; score / threshold` header. Scores are parsed as signed real numbers so legitimate negative ham scores do not trigger fallback classification.
+A webhook auth or validation response is acceptable. Cloudflare `502`, `1033`, or tunnel errors indicate a tunnel/hostname/origin problem.
 
-To use Postmark SpamCheck instead of the local daemon:
+### Test local mail server reachability
 
-```dotenv
-SPAMASSASSIN_MODE=postmark
-POSTMARK_SPAMCHECK_URL=https://spamcheck.postmarkapp.com/filter
+```bash
+nc -vz mail.internal.example 25
 ```
 
-Postmark mode sends the raw email to the SpamCheck API with `options=short` and uses the returned SpamAssassin `score`. The container skips starting local `spamd` in this mode.
+Or, from inside the container:
 
-### Optional Spamhaus Reputation Checks
+```bash
+docker exec -it mail-bridge sh -lc 'node -e "
+const net=require(\"net\");
+const s=net.createConnection(process.env.LOCAL_MAIL_PORT, process.env.LOCAL_MAIL_HOST);
+s.on(\"connect\",()=>{ console.log(\"SMTP reachable\"); process.exit(0); });
+s.on(\"error\",e=>{ console.error(e); process.exit(1); });
+"'
+```
 
-Spamhaus integration is optional and disabled by default:
+### Test inbound mail
+
+Send an email to an address routed to the Worker.
+
+Watch logs:
+
+```bash
+docker logs -f mail-bridge
+```
+
+Successful inbound delivery looks like:
+
+```text
+[Webhook] Inbound payload accepted ...
+[SpamAssassin] Score resolved ...
+[Webhook] Injected inbound local-mail headers ...
+Direct delivery successful.
+```
+
+### Test outbound SMTP relay
+
+Install `swaks` if needed:
+
+```bash
+brew install swaks
+```
+
+Test relay:
+
+```bash
+swaks \
+  --server 127.0.0.1 \
+  --port 2525 \
+  --from postmaster@example.com \
+  --to recipient@example.net \
+  --header "Subject: Mailbridge outbound test" \
+  --body "This is an outbound relay test through Mailbridge."
+```
+
+Successful relay acceptance looks like:
+
+```text
+MAIL FROM accepted
+RCPT accepted
+Received message from local relay client
+```
+
+If the upstream provider is unavailable, Mailbridge queues the message for retry.
+
+## Troubleshooting
+
+### `Connection refused` on port 2525
+
+The SMTP relay may be listening inside the container but not published to the host.
+
+Check:
+
+```bash
+docker compose ps
+```
+
+You should see:
+
+```text
+0.0.0.0:2525->2525/tcp
+```
+
+If not, add a local compose override:
+
+```yaml
+services:
+  mail-bridge:
+    ports:
+      - "3090:3090"
+      - "2525:2525"
+```
+
+Restart:
+
+```bash
+docker compose up -d
+```
+
+### `SMTP relay connection from ... is not allowed`
+
+Add the client network to:
+
+```dotenv
+SMTP_RELAY_ALLOWED_CIDRS=
+```
+
+For Docker Desktop on macOS, the client may appear as `192.168.65.1`. Add:
+
+```dotenv
+SMTP_RELAY_ALLOWED_CIDRS=192.168.65.0/24,127.0.0.1/32
+```
+
+Include your LAN CIDR if needed:
+
+```dotenv
+SMTP_RELAY_ALLOWED_CIDRS=192.168.1.0/24,192.168.65.0/24,127.0.0.1/32
+```
+
+### `getaddrinfo ENOTFOUND postmaster.example.com`
+
+The container cannot resolve the Worker hostname configured in:
+
+```dotenv
+CLOUDFLARE_SEND_WORKER_URL=
+```
+
+Use the deployed `workers.dev` URL temporarily:
+
+```dotenv
+CLOUDFLARE_SEND_WORKER_URL=https://your-worker.your-account.workers.dev/api/send/email
+```
+
+Then switch back to the custom hostname once DNS is correct.
+
+### Wrangler deploy warning: unexpected `send_email`
+
+Bad syntax:
+
+```toml
+[[queues.consumers]]
+queue = "mailbridge-inbound"
+
+send_email = [
+  { name = "EMAIL" }
+]
+```
+
+Correct syntax:
+
+```toml
+[[queues.consumers]]
+queue = "mailbridge-inbound"
+
+[[send_email]]
+name = "EMAIL"
+```
+
+After deploy, Wrangler output should show `env.EMAIL`.
+
+### SpamAssassin DNSBL warnings
+
+You may see warnings such as:
+
+```text
+RCVD_IN_DNSWL_BLOCKED
+URIBL_BLOCKED
+RCVD_IN_ZEN_BLOCKED_OPENDNS
+```
+
+These usually mean DNSBL providers are rate-limiting or blocking lookups from your resolver. Mailbridge can still parse the SpamAssassin score.
+
+Options:
+
+- use a better resolver
+- disable affected SpamAssassin DNSBL rules
+- use Postmark SpamCheck mode
+- enable/disable Spamhaus explicitly based on your deployment
+
+### Spamhaus enabled but credentials missing
+
+If logs show:
+
+```text
+Spamhaus is enabled but SPAMHAUS_USERNAME/SPAMHAUS_PASSWORD are not configured
+```
+
+Either provide credentials:
+
+```dotenv
+SPAMHAUS_ENABLED=true
+SPAMHAUS_USERNAME=...
+SPAMHAUS_PASSWORD=...
+```
+
+or disable it:
 
 ```dotenv
 SPAMHAUS_ENABLED=false
 ```
 
-When enabled, Mailbridge checks the original sender IP provided by the Worker payload after decryption, not the Cloudflare request IP that delivered the webhook. It also derives a normalized sender domain and checks that against Spamhaus domain listings.
+### TLS ServerName warning with IP local mail host
 
-Mailbridge caches the temporary Spamhaus bearer token and the Spamhaus TLD list in memory. It does not log in for every message.
+If `LOCAL_MAIL_HOST` is an IP and TLS is used, Node may warn that TLS ServerName cannot be an IP.
 
-### Optional AI Scanning
-
-AI scanning is optional and disabled by default:
+Set:
 
 ```dotenv
-AI_ENABLED=false
+LOCAL_MAIL_TLS_SERVERNAME=mail.internal.example
 ```
 
-When enabled without `AI_BASE_URL`, Mailbridge uses OpenAI by default through the official OpenAI SDK. If you set `AI_BASE_URL`, the same SDK can target a LiteLLM proxy or another OpenAI-compatible local endpoint instead.
-
-Example direct OpenAI configuration:
+or disable local TLS only for lab testing:
 
 ```dotenv
-AI_ENABLED=true
-AI_API_KEY=sk-...
-AI_MODEL=gpt-5.4-nano
-AI_INPUT_SCOPE=headers
+LOCAL_MAIL_REQUIRE_TLS=false
+LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED=false
 ```
 
-Example LiteLLM or local OpenAI-compatible endpoint:
+## Security Notes
 
-```dotenv
-AI_ENABLED=true
-AI_API_KEY=proxy-or-local-token-if-needed
-AI_BASE_URL=http://litellm.internal:4000/v1
-AI_MODEL=gpt-5.4-nano
-AI_INPUT_SCOPE=attachments
+- Never commit `.env`.
+- Never commit private keys.
+- Never commit tunnel tokens.
+- Never commit Worker secrets.
+- Keep `secrets/` separate from `data/` where possible.
+- Keep `SMTP_RELAY_ENABLED=false` unless you actually need outbound relay.
+- Do not expose the SMTP relay publicly.
+- Prefer TLS and narrow CIDR allowlists for the relay.
+- Prefer verified TLS for local mail delivery.
+- Leave AI scanning disabled unless your compliance posture allows it.
+
+Recommended `.gitignore` entries:
+
+```gitignore
+.env
+.env.*
+!.env.example
+
+data/
+secrets/
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+
+node_modules/
+.wrangler/
 ```
-
-Available AI input scopes:
-
-- `headers`: sends only the email headers to the model
-- `attachments`: sends the headers plus attachment filenames only
-- `full_email`: sends headers and body
-
-`AI_INPUT_SCOPE=attachments` does not read or send attachment contents to AI. It only derives attachment names locally from MIME metadata and sends those names alongside the headers. This is useful when suspicious filename patterns are part of the signal, such as receiving `Invoice.pdf` from an obviously untrusted sender domain.
-
-When AI scanning runs, Mailbridge now expects structured JSON from the model with:
-
-- `spam`: `1` or `0`
-- `reason`: a short category such as `phishing`, `impersonation`, or `crypto`
-- `score`: a spam-likelihood score from `0` to `9`
-
-`score=9` means absolutely spam. `score=0` means not at all likely to be spam.
-
-If AI is the component that classifies a message, Mailbridge injects:
-
-- `X-Mailbridge-Reason` for the short semantic category
-- `X-Mailbridge-PS` for the 0-9 probability score
-
-For OpenAI-backed deployments, review OpenAI’s business data controls and enable Zero Data Retention or stricter controls where your compliance posture requires it. For PCI/HIPAA-style environments, leave AI scanning disabled unless your legal, compliance, and vendor-review process has approved the provider path.
 
 ## Security and Reliability
 
 - All inbound webhook requests require the shared `X-Webhook-Secret` header.
-- Inbound sender reputation uses the original sender IP from the decrypted Worker payload, not the Worker request IP.
-- Temporary local-mail or upstream provider failures are queued and retried.
-- Queued messages are encrypted at rest and are written only when delivery must be deferred.
-- R2-stored inbound mail is encrypted before storage and only Mailbridge can decrypt it.
-- Permanent SMTP or API failures are rejected instead of retried forever.
+- R2-stored inbound mail is encrypted before storage.
+- Only Mailbridge has the private key required to decrypt inbound R2 payloads.
+- Temporary local-mail and upstream-provider failures are queued and retried.
+- Queued messages are encrypted at rest.
+- Active queue secrets live in `secrets/secrets.db`.
+- Audit data lives in `data/mailbridge.db`.
+- Permanent SMTP/API failures are rejected instead of retried forever.
+
+## License
 
 Copyright © 2026 Ra's al Ghul

@@ -1,5 +1,18 @@
-# Mac Shit
+# macOS
 .DS_Store
+
+# Runtime data and secrets (never commit)
+data/
+secrets/
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+
+# Wrangler
+.wrangler/
+wrangler.toml
 
 # Logs
 logs
