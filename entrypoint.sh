@@ -7,6 +7,7 @@ SPAMD_PID=""
 MAILBRIDGE_PID=""
 CLOUDFLARED_PID=""
 SHUTTING_DOWN=0
+SPAMASSASSIN_MODE="${SPAMASSASSIN_MODE:-local}"
 
 log() {
   echo "[entrypoint] $*"
@@ -83,25 +84,36 @@ resolve_spamd_bin() {
   return 1
 }
 
-if ! SPAMD_BIN="$(resolve_spamd_bin)"; then
-  echo "[entrypoint] spamd was not found in PATH or /usr/sbin. Verify the image includes the SpamAssassin daemon." >&2
-  exit 127
-fi
+case "${SPAMASSASSIN_MODE}" in
+  local)
+    if ! SPAMD_BIN="$(resolve_spamd_bin)"; then
+      echo "[entrypoint] spamd was not found in PATH or /usr/sbin. Verify the image includes the SpamAssassin daemon." >&2
+      exit 127
+    fi
 
-log "Starting SpamAssassin"
-"${SPAMD_BIN}" \
-  --create-prefs \
-  --helper-home-dir \
-  --listen 127.0.0.1 \
-  --max-children 5 \
-  --syslog=stderr \
-  --port "${SPAMD_PORT:-783}" &
-SPAMD_PID=$!
+    log "Starting SpamAssassin"
+    "${SPAMD_BIN}" \
+      --create-prefs \
+      --helper-home-dir \
+      --listen 127.0.0.1 \
+      --max-children 5 \
+      --syslog=stderr \
+      --port "${SPAMD_PORT:-783}" &
+    SPAMD_PID=$!
 
-if ! wait_for_spamd; then
-  stop_all
-  exit 1
-fi
+    if ! wait_for_spamd; then
+      stop_all
+      exit 1
+    fi
+    ;;
+  postmark)
+    log "Using Postmark SpamCheck for SpamAssassin scoring; local spamd will not be started"
+    ;;
+  *)
+    echo "[entrypoint] Unsupported SPAMASSASSIN_MODE=${SPAMASSASSIN_MODE}. Use local or postmark." >&2
+    exit 2
+    ;;
+esac
 
 if [[ "${CLOUDFLARED_ENABLED:-false}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss])$ ]]; then
   if [[ -z "${CLOUDFLARED_TUNNEL_TOKEN:-}" ]]; then
@@ -123,7 +135,10 @@ log "Starting Mailbridge"
 node server.js &
 MAILBRIDGE_PID=$!
 
-REQUIRED_PIDS=("$SPAMD_PID" "$MAILBRIDGE_PID")
+REQUIRED_PIDS=("$MAILBRIDGE_PID")
+if [[ -n "$SPAMD_PID" ]]; then
+  REQUIRED_PIDS+=("$SPAMD_PID")
+fi
 if [[ -n "$CLOUDFLARED_PID" ]]; then
   REQUIRED_PIDS+=("$CLOUDFLARED_PID")
 fi

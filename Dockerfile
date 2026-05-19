@@ -26,7 +26,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gnupg \
     spamd \
-    spamc \
     && install -m 0755 -d /usr/share/keyrings \
     && curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
       | gpg --dearmor -o /usr/share/keyrings/cloudflare-main.gpg \

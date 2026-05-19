@@ -85,6 +85,7 @@ Important notes:
 - `MAILGUN_DOMAIN` is required only when `RELAY_UPSTREAM_PROVIDER=mailgun`. If you use Mailgun EU, set `MAILGUN_BASE_URL=https://api.eu.mailgun.net`.
 - `CLOUDFLARE_SEND_WORKER_URL` is required when `RELAY_UPSTREAM_PROVIDER=cloudflare`. It should point to the Worker `fetch()` endpoint that calls the Cloudflare Email Service `EMAIL.send()` binding.
 - `CLOUDFLARE_SEND_WEBHOOK_SECRET` is required when `RELAY_UPSTREAM_PROVIDER=cloudflare`. If omitted, Mailbridge falls back to `WEBHOOK_SECRET`.
+- `SPAMASSASSIN_MODE=local` starts the in-container `spamd` daemon. Set `SPAMASSASSIN_MODE=postmark` to use Postmark SpamCheck instead and skip the local daemon.
 - `SPAMHAUS_ENABLED=false` and `AI_ENABLED=false` in `.env.example` are intentional. Both controls are optional and must be enabled deliberately.
 - The outbound SMTP relay is disabled by default. If you want to use it, set `SMTP_RELAY_ENABLED=true`, then set `SMTP_RELAY_TLS_CERT_FILE` and `SMTP_RELAY_TLS_KEY_FILE` before exposing or using port `2525`.
 - Local mail delivery is TLS-first by default. If your local mail server does not support a verifiable TLS path yet, you must explicitly opt out with `LOCAL_MAIL_REQUIRE_TLS=false` and, if needed, `LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED=false`.
@@ -355,6 +356,25 @@ Inbound mail stored in R2 is encrypted before it is written:
 - only Mailbridge has the private key and can decrypt the message before spam checks, AI checks, and local delivery
 
 This means Cloudflare stores encrypted mail objects instead of plaintext raw messages. During rollout, legacy plaintext R2 objects can still be processed until the old backlog drains.
+
+### SpamAssassin Scoring Mode
+
+Mailbridge uses local SpamAssassin by default:
+
+```dotenv
+SPAMASSASSIN_MODE=local
+```
+
+In local mode, the container starts `spamd` and Mailbridge sends a protocol `CHECK` request. Per the `spamd` protocol, successful replies use `0 EX_OK` and include a `Spam: True|False ; score / threshold` header. Scores are parsed as signed real numbers so legitimate negative ham scores do not trigger fallback classification.
+
+To use Postmark SpamCheck instead of the local daemon:
+
+```dotenv
+SPAMASSASSIN_MODE=postmark
+POSTMARK_SPAMCHECK_URL=https://spamcheck.postmarkapp.com/filter
+```
+
+Postmark mode sends the raw email to the SpamCheck API with `options=short` and uses the returned SpamAssassin `score`. The container skips starting local `spamd` in this mode.
 
 ### Optional Spamhaus Reputation Checks
 

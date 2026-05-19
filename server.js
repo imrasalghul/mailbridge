@@ -49,6 +49,7 @@ const dbPath = path.join(dataDir, 'mailbridge.db');
 const secretsDbPath = path.resolve(process.env.SECRETS_DB_PATH || path.join(__dirname, 'secrets', 'secrets.db'));
 const legacyDbPath = path.join(__dirname, 'mail_queue.sqlite');
 const spamcTimeoutMs = Number.parseInt(process.env.SPAMC_TIMEOUT_MS || '10000', 10);
+const spamAssassinMode = (process.env.SPAMASSASSIN_MODE || 'local').toLowerCase();
 const hardBlockThreshold = Number.parseFloat(process.env.SA_BLOCK_THRESHOLD || '12');
 const questionableThreshold = Number.parseFloat(process.env.SA_QUESTIONABLE_THRESHOLD || '5');
 const spamSclScore = Number.parseInt(process.env.SPAM_SCL_SCORE || '9', 10);
@@ -154,6 +155,8 @@ async function start() {
     host: process.env.SPAMD_HOST || '127.0.0.1',
     port: Number.parseInt(process.env.SPAMD_PORT || '783', 10),
     timeoutMs: spamcTimeoutMs,
+    mode: spamAssassinMode,
+    postmarkUrl: process.env.POSTMARK_SPAMCHECK_URL,
     log: logVerbose
   });
   const aiClassifier = createAiClassifier({
