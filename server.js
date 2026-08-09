@@ -110,7 +110,7 @@ async function applyMiddlewarePlugins({ requestId, from, to, rawEmail, sourceIp 
       }, pluginEnvironment(manifest));
       if (!response.ok) throw Object.assign(new Error(response.error || `Middleware ${manifest.id} failed`), { permanent: response.permanent });
       const result = response.result || {};
-      if (result.action === 'reject') return { rejected: true, reason: result.reason || manifest.id };
+      if (result.action === 'reject') return { rejected: true, reason: result.reason || manifest.id, pluginId: manifest.id, pluginVersion: manifest.version };
       if (typeof result.rawEmail === 'string') current.rawEmail = result.rawEmail;
       if (typeof result.from === 'string') current.from = result.from;
       if (typeof result.to === 'string') current.to = result.to;
@@ -187,8 +187,8 @@ async function start() {
       requestId: `${providerId}-${Date.now()}`,
       payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64'), context: { relayHostname: mailbridgeHostname, injectHeaders: smtpRelayInjectHeaders, fromFallback: relayFromFallback } }
     }, pluginEnvironment(manifest));
-    if (!response.ok) throw Object.assign(new Error(response.error || `Provider ${providerId} failed`), { permanent: response.permanent, statusCode: response.statusCode });
-    return response.result;
+    if (!response.ok) throw Object.assign(new Error(response.error || `Provider ${providerId} failed`), { permanent: response.permanent, statusCode: response.statusCode, pluginId: manifest.id, pluginVersion: manifest.version });
+    return { ...(response.result || {}), pluginId: manifest.id, pluginVersion: manifest.version };
   };
   const spamAssassinClient = createSpamAssassinClient({
     host: process.env.SPAMD_HOST || '127.0.0.1',
@@ -200,7 +200,8 @@ async function start() {
   });
   const classifyWithPlugins = async (rawEmail, requestId) => {
     const results = await invokeCapability('scanner', 'classification', 'scan', { rawEmail, requestId });
-    return results.map(({ result }) => result).find((result) => result.spam === '1' || result.spam === '0') || null;
+    const match = results.find(({ result }) => result.spam === '1' || result.spam === '0');
+    return match ? { ...match.result, pluginId: match.plugin.id, pluginVersion: match.plugin.version } : null;
   };
   const inboundMessageDecryptor = createInboundMessageDecryptor();
 
@@ -228,7 +229,7 @@ async function start() {
           status: upstreamResult?.status,
           messageId: upstreamResult?.messageId
         });
-        return;
+        return upstreamResult;
       }
 
       await localMailTransport.sendMail({
@@ -257,7 +258,9 @@ async function start() {
       details: {
         stage,
         reason: result?.reason || null,
-        score: result?.score ?? null
+        score: result?.score ?? null,
+        pluginId: result?.pluginId || null,
+        pluginVersion: result?.pluginVersion || null
       }
     });
   }
@@ -319,7 +322,8 @@ async function start() {
 
     try {
       const reputationResults = await invokeCapability('scanner', 'reputation', 'scan', { senderIp: sourceIp, envelopeFrom: from, rawEmail: raw, requestId });
-      const reputationCheck = reputationResults.map(({ result }) => result).find((result) => result.blocked) || {};
+      const reputationMatch = reputationResults.find(({ result }) => result.blocked);
+      const reputationCheck = reputationMatch ? { ...reputationMatch.result, pluginId: reputationMatch.plugin.id, pluginVersion: reputationMatch.plugin.version } : {};
       const senderDomain = reputationCheck.senderDomain || extractDomainFromAddress(from);
 
       if (reputationCheck.blocked) {
@@ -337,7 +341,9 @@ async function start() {
           details: {
             ipHit: reputationCheck.ipHit,
             domainHit: reputationCheck.domainHit,
-            datasets: reputationCheck.datasets || []
+            datasets: reputationCheck.datasets || [],
+            pluginId: reputationCheck.pluginId,
+            pluginVersion: reputationCheck.pluginVersion
           }
         });
         return res.status(406).send('Rejected by reputation filter');
@@ -484,7 +490,7 @@ async function start() {
       const finalRaw = prependHeadersToRaw(taggedRaw, headers);
       const middlewareResult = await applyMiddlewarePlugins({ requestId, from, to, rawEmail: finalRaw, sourceIp });
       if (middlewareResult.rejected) {
-        await auditStore.logEvent({ requestId, eventType: 'middleware_blocked', direction: 'inbound', target: 'local_mail', outcome: 'blocked', sender: from, recipient: to, sourceIp, errorMessage: middlewareResult.reason });
+        await auditStore.logEvent({ requestId, eventType: 'middleware_blocked', direction: 'inbound', target: 'local_mail', outcome: 'blocked', sender: from, recipient: to, sourceIp, errorMessage: middlewareResult.reason, details: { pluginId: middlewareResult.pluginId, pluginVersion: middlewareResult.pluginVersion } });
         return res.status(406).send(`Rejected by middleware: ${middlewareResult.reason}`);
       }
       const transformedFrom = middlewareResult.from;

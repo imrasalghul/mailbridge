@@ -91,3 +91,12 @@ test('middleware plugins can transform complete RFC822 messages', async () => {
   const response = await createPluginManager({ pluginDirectory: root }).invoke('headers', 'transform', { requestId: 'middleware-1', payload: { rawEmail: 'Subject: test\r\n\r\nbody' } });
   assert.equal(response.result.rawEmail, 'X-Community: yes\r\nSubject: test\r\n\r\nbody');
 });
+
+test('runtime discovery enforces an existing plugin lockfile', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-lock-test-'));
+  const pluginDirectory = path.join(root, 'unlocked');
+  fs.mkdirSync(pluginDirectory, { recursive: true });
+  fs.writeFileSync(path.join(pluginDirectory, 'mailbridge-plugin.json'), JSON.stringify({ apiVersion: 1, id: 'unlocked', version: '1.0.0', type: 'middleware', failurePolicy: 'fail-open', entrypoint: 'index.js', config: {}, secrets: {} }));
+  fs.writeFileSync(path.join(root, 'plugins.lock.json'), JSON.stringify({ apiVersion: 1, plugins: {} }));
+  assert.deepEqual(createPluginManager({ pluginDirectory: root, lockfilePath: path.join(root, 'plugins.lock.json') }).discover(), []);
+});
