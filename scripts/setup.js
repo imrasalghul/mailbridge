@@ -6,6 +6,7 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const readline = require('node:readline/promises');
+const { createPluginManager, assertExactPackageSpecifier } = require('../lib/plugin-manager');
 
 function envValue(value) {
   const text = String(value ?? '');
@@ -93,6 +94,8 @@ function generateArtifacts(config, generated = {}) {
     QUEUE_MAX_ATTEMPTS: 20,
     DATA_DIR: config.dataDir || '/app/data',
     SECRETS_DB_PATH: config.secretsDbPath || '/app/secrets/secrets.db',
+    MAILBRIDGE_PLUGIN_DIR: config.pluginDirectory || '/app/plugins',
+    MAILBRIDGE_PLUGIN_LOCKFILE: config.pluginLockfile || '/app/plugins.lock.json',
     QUEUE_MASTER_KEY: queueMasterKey,
     MAILBRIDGE_PRIVATE_KEY_PATH: config.privateKeyPath || '/app/secrets/mailbridge-r2-private.pem',
     AUDIT_LOG_RETENTION_DAYS: 1,
@@ -148,7 +151,7 @@ function generateArtifacts(config, generated = {}) {
   };
 
   const sections = [
-    ['Node App Configuration', ['PORT', 'SMTP_RELAY_PORT', 'SMTP_RELAY_SOCKET_TIMEOUT_MS', 'SMTP_RELAY_MAX_MESSAGE_BYTES', 'MAILBRIDGE_VERBOSE_LOGGING', 'MAILBRIDGE_HOSTNAME', 'QUEUE_MAX_ATTEMPTS', 'DATA_DIR', 'SECRETS_DB_PATH', 'QUEUE_MASTER_KEY', 'MAILBRIDGE_PRIVATE_KEY_PATH', 'AUDIT_LOG_RETENTION_DAYS']],
+    ['Node App Configuration', ['PORT', 'SMTP_RELAY_PORT', 'SMTP_RELAY_SOCKET_TIMEOUT_MS', 'SMTP_RELAY_MAX_MESSAGE_BYTES', 'MAILBRIDGE_VERBOSE_LOGGING', 'MAILBRIDGE_HOSTNAME', 'QUEUE_MAX_ATTEMPTS', 'DATA_DIR', 'SECRETS_DB_PATH', 'MAILBRIDGE_PLUGIN_DIR', 'MAILBRIDGE_PLUGIN_LOCKFILE', 'QUEUE_MASTER_KEY', 'MAILBRIDGE_PRIVATE_KEY_PATH', 'AUDIT_LOG_RETENTION_DAYS']],
     ['Optional in-container Cloudflare Tunnel', ['CLOUDFLARED_ENABLED', 'CLOUDFLARED_TUNNEL_TOKEN', 'CLOUDFLARED_LOGLEVEL']],
     ['Shared Worker Authentication', ['WEBHOOK_SECRET']],
     ['Local Mail Server Configuration', ['LOCAL_MAIL_HOST', 'LOCAL_MAIL_PORT', 'LOCAL_MAIL_SECURE', 'LOCAL_MAIL_REQUIRE_TLS', 'LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED', 'LOCAL_MAIL_TLS_SERVERNAME', 'LOCAL_MAIL_TLS_CA_FILE']],
@@ -172,6 +175,8 @@ async function runSetup({
   keyDirectory = path.join(cwd, 'secrets'),
   dataDirectory = path.join(cwd, 'data'),
   runtimePaths = {},
+  pluginDirectory = path.join(dataDirectory, 'plugins'),
+  pluginLockfile = path.join(cwd, 'plugins.lock.json'),
   systemMode = false
 } = {}) {
   const rl = readline.createInterface({ input, output });
@@ -206,6 +211,32 @@ async function runSetup({
     const localMailTlsCaFile = localMailRequireTls ? await ask(`Custom CA file ${pathContext} (optional)`, '') : '';
     const spamAssassinMode = await askChoice('Spam filtering mode', ['local', 'postmark'], 'local');
     const upstreamProvider = await askChoice('Outbound provider', ['sendgrid', 'resend', 'mailgun', 'cloudflare'], 'sendgrid');
+    const targets = [envFileName, 'wrangler.toml'].map((name) => path.join(cwd, name));
+    const existing = targets.filter((target) => fs.existsSync(target));
+    if (existing.length && !await askBoolean(`Overwrite ${existing.map((file) => path.basename(file)).join(' and ')}`, false)) {
+      output.write('No files changed.\n');
+      return { written: false };
+    }
+    const pluginManager = createPluginManager({
+      pluginDirectory,
+      lockfilePath: pluginLockfile,
+      log: (scope, message, details) => output.write(`${scope} ${message} ${JSON.stringify(details)}\n`)
+    });
+    const selectedPlugins = [];
+    const installSelectedPlugin = async (label, defaultSpecifier) => {
+      if (!await askBoolean(`Enable ${label} plugin`, false)) return;
+      const specifier = assertExactPackageSpecifier(await ask(`Exact npm package/version for ${label}`, defaultSpecifier));
+      pluginManager.install(specifier);
+      selectedPlugins.push(label.toLowerCase());
+    };
+    await installSelectedPlugin('Spamhaus', 'mailbridge-plugin-spamhaus@1.0.0');
+    await installSelectedPlugin('Codex AI scanning', 'mailbridge-plugin-codex@1.0.0');
+    if (['sendgrid', 'resend', 'mailgun'].includes(upstreamProvider)) {
+      const pluginName = upstreamProvider[0].toUpperCase() + upstreamProvider.slice(1);
+      const providerSpecifier = assertExactPackageSpecifier(await ask(`Exact npm package/version for ${pluginName}`, `mailbridge-plugin-${upstreamProvider}@1.0.0`));
+      pluginManager.install(providerSpecifier);
+      selectedPlugins.push(upstreamProvider);
+    }
     const relayFrom = await ask('Fallback outbound From address', `postmaster@${hostname}`);
     const mailgunDomain = upstreamProvider === 'mailgun' ? await ask('Mailgun sending domain') : '';
     const workerSendUrl = upstreamProvider === 'cloudflare' ? await ask('Deployed Worker send URL') : '';
@@ -234,13 +265,6 @@ async function runSetup({
     const r2BucketName = await ask('R2 bucket name', 'mailbridge-inbound');
     const queueName = await ask('Cloudflare Queue name', 'mailbridge-inbound');
 
-    const targets = [envFileName, 'wrangler.toml'].map((name) => path.join(cwd, name));
-    const existing = targets.filter((target) => fs.existsSync(target));
-    if (existing.length && !await askBoolean(`Overwrite ${existing.map((file) => path.basename(file)).join(' and ')}`, false)) {
-      output.write('No files changed.\n');
-      return { written: false };
-    }
-
     const keyDir = keyDirectory;
     const privateKeyPath = path.join(keyDir, 'mailbridge-r2-private.pem');
     const publicKeyPath = path.join(keyDir, 'mailbridge-r2-public.pem');
@@ -251,7 +275,7 @@ async function runSetup({
       keys = generateKeyPair();
     }
 
-    const artifacts = generateArtifacts({ hostname, workerName, localMailHost, localMailPort, localMailRequireTls, localMailTlsServername, localMailTlsCaFile, spamAssassinMode, upstreamProvider, relayFrom, mailgunDomain, workerSendUrl, smtpRelayEnabled, allowedCidrs, smtpRelayRequireTls, smtpRelayAllowInsecure, smtpRelayTlsCertFile, smtpRelayTlsKeyFile, smtpRelayTlsCaFile, cloudflaredEnabled, cloudflareTunnelToken, r2BucketName, queueName, ...runtimePaths }, { publicKey: keys?.publicKey || (fs.existsSync(publicKeyPath) ? fs.readFileSync(publicKeyPath, 'utf8') : '') });
+    const artifacts = generateArtifacts({ hostname, workerName, localMailHost, localMailPort, localMailRequireTls, localMailTlsServername, localMailTlsCaFile, spamAssassinMode, upstreamProvider, relayFrom, mailgunDomain, workerSendUrl, smtpRelayEnabled, allowedCidrs, smtpRelayRequireTls, smtpRelayAllowInsecure, smtpRelayTlsCertFile, smtpRelayTlsKeyFile, smtpRelayTlsCaFile, cloudflaredEnabled, cloudflareTunnelToken, r2BucketName, queueName, pluginDirectory, pluginLockfile, ...runtimePaths }, { publicKey: keys?.publicKey || (fs.existsSync(publicKeyPath) ? fs.readFileSync(publicKeyPath, 'utf8') : '') });
     fs.mkdirSync(path.join(dataDirectory, 'queue'), { recursive: true, mode: 0o700 });
     fs.mkdirSync(keyDir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(targets[0], artifacts.envText, { mode: 0o600 });
@@ -265,6 +289,7 @@ async function runSetup({
 
     const npxCommand = systemMode ? '/opt/mailbridge/node/bin/npx' : 'npx';
     output.write(`\nConfiguration generated. Secrets were written to ${envFileName}.\n`);
+    if (selectedPlugins.length) output.write(`Installed plugins: ${selectedPlugins.join(', ')}\n`);
     const deployAutomatically = await askBoolean('Deploy the Cloudflare Worker automatically now', false);
     if (deployAutomatically) {
       try {
@@ -306,6 +331,8 @@ if (require.main === module) {
     envFileName: 'mailbridge.env',
     keyDirectory: '/etc/mailbridge/keys',
     dataDirectory: '/var/lib/mailbridge',
+    pluginDirectory: '/var/lib/mailbridge/plugins',
+    pluginLockfile: '/etc/mailbridge/plugins.lock.json',
     runtimePaths: {
       dataDir: '/var/lib/mailbridge',
       secretsDbPath: '/var/lib/mailbridge/secrets.db',

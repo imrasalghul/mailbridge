@@ -71,6 +71,7 @@ test('setup artifacts support native Debian paths and packaged Worker entrypoint
 
   assert.match(artifacts.envText, /^DATA_DIR=\/var\/lib\/mailbridge$/m);
   assert.match(artifacts.envText, /^SECRETS_DB_PATH=\/var\/lib\/mailbridge\/secrets\.db$/m);
+  assert.match(artifacts.envText, /^MAILBRIDGE_PLUGIN_DIR=\/app\/plugins$/m);
   assert.match(artifacts.envText, /^MAILBRIDGE_PRIVATE_KEY_PATH=\/etc\/mailbridge\/keys\/mailbridge-r2-private\.pem$/m);
   assert.match(artifacts.wranglerText, /^main = "\/opt\/mailbridge\/app\/worker\.js"$/m);
 });

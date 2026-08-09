@@ -37,6 +37,7 @@ trusted CIDR-restricted SMTP client
 - Audit-only SQLite event database
 - Optional in-container Cloudflare Tunnel
 - Interactive configuration generator
+- Explicit, exact-version plugin system for scanners and outbound providers
 
 ## Quick Start
 
@@ -55,6 +56,8 @@ npm run setup
 ```
 
 The assistant creates `.env`, `wrangler.toml`, runtime directories, independent webhook secrets, the local queue master key, and the RSA keypair used for encrypted R2 handoff. It asks before overwriting existing configuration.
+
+Optional scanners and outbound providers are installed as exact-version plugins. For example, use `mailbridge-plugin-spamhaus@1.0.0`; unversioned packages, `latest`, and version ranges are rejected. Plugins run in supervised child processes and receive only their declared namespaced settings and secrets.
 
 Then run the Cloudflare commands printed by the assistant and start Mailbridge:
 

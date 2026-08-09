@@ -15,7 +15,7 @@ if ! getent passwd mailbridge >/dev/null; then
 fi
 
 install -d -o root -g mailbridge -m 0750 /etc/mailbridge
-install -d -o mailbridge -g mailbridge -m 0750 /var/lib/mailbridge /var/lib/mailbridge/queue
+install -d -o mailbridge -g mailbridge -m 0750 /var/lib/mailbridge /var/lib/mailbridge/queue /var/lib/mailbridge/plugins
 
 systemctl daemon-reload >/dev/null 2>&1 || true
 

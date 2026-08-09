@@ -12,6 +12,7 @@ const { createCloudflareDelivery } = require('./lib/cloudflare-delivery');
 const { extractDomainFromAddress } = require('./lib/email-metadata');
 const { createInboundMessageDecryptor } = require('./lib/inbound-message-crypto');
 const { createLocalMailTransport } = require('./lib/local-mail-transport');
+const { createPluginManager } = require('./lib/plugin-manager');
 const { createMailgunDelivery } = require('./lib/mailgun-delivery');
 const { createQueueCrypto } = require('./lib/queue-crypto');
 const { createQueueManager } = require('./lib/queue-manager');
@@ -64,6 +65,44 @@ const spamcFailOpen = parseBoolean(process.env.SPAMC_FAIL_OPEN, false);
 const configuredUpstreamProvider = assertSupportedUpstreamProvider(process.env.RELAY_UPSTREAM_PROVIDER || 'sendgrid');
 const relayApiKey = process.env.RELAY_API_KEY || '';
 const relayFromFallback = process.env.RELAY_FROM_FALLBACK || process.env.SENDGRID_FROM_FALLBACK || 'postmaster@localhost';
+const pluginManager = createPluginManager({
+  pluginDirectory: process.env.MAILBRIDGE_PLUGIN_DIR || path.join(__dirname, 'plugins'),
+  lockfilePath: process.env.MAILBRIDGE_PLUGIN_LOCKFILE || path.join(__dirname, 'plugins.lock.json'),
+  log: (...args) => logVerbose(...args)
+});
+
+function hasPlugin(id) {
+  try {
+    pluginManager.find(id);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pluginSettings(prefix, excluded = []) {
+  return Object.fromEntries(Object.entries(process.env)
+    .filter(([key]) => key.startsWith(`${prefix}_`) && !excluded.includes(key))
+    .map(([key, value]) => [key.slice(prefix.length + 1), value]));
+}
+
+async function invokePlugin(id, operation, payload, { configPrefix, secretKeys = [] } = {}) {
+  const secrets = Object.fromEntries(secretKeys.map((key) => [key, process.env[key] || '']));
+  const response = await pluginManager.invoke(id, operation, {
+    requestId: payload.requestId,
+    payload: payload.payload
+  }, {
+    config: configPrefix ? pluginSettings(configPrefix, secretKeys) : {},
+    secrets
+  });
+  if (!response.ok) {
+    const error = new Error(response.error || `Plugin ${id} failed`);
+    error.permanent = response.permanent;
+    error.statusCode = response.statusCode;
+    throw error;
+  }
+  return response.result;
+}
 
 function logVerbose(scope, message, details = {}) {
   if (!verboseAppLogging) return;
@@ -113,14 +152,14 @@ async function start() {
   await queueStore.migrateLegacyQueue(legacyDbPath);
 
   const localMailTransport = createLocalMailTransport();
-  const sendViaSendGrid = createSendGridDelivery({
+  const coreSendViaSendGrid = createSendGridDelivery({
     apiKey: relayApiKey,
     injectHeaders: smtpRelayInjectHeaders,
     relayHostname: mailbridgeHostname,
     fromFallback: relayFromFallback,
     log: logVerbose
   });
-  const sendViaResend = createResendDelivery({
+  const coreSendViaResend = createResendDelivery({
     apiKey: relayApiKey,
     baseUrl: process.env.RESEND_BASE_URL || 'https://api.resend.com',
     injectHeaders: smtpRelayInjectHeaders,
@@ -128,7 +167,7 @@ async function start() {
     fromFallback: relayFromFallback,
     log: logVerbose
   });
-  const sendViaMailgun = createMailgunDelivery({
+  const coreSendViaMailgun = createMailgunDelivery({
     apiKey: relayApiKey,
     domain: process.env.MAILGUN_DOMAIN,
     baseUrl: process.env.MAILGUN_BASE_URL || 'https://api.mailgun.net',
@@ -145,6 +184,15 @@ async function start() {
     fromFallback: relayFromFallback,
     log: logVerbose
   });
+  const sendViaSendGrid = hasPlugin('sendgrid')
+    ? (from, to, rawInput) => invokePlugin('sendgrid', 'deliver', { requestId: `sendgrid-${Date.now()}`, payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64') } }, { configPrefix: 'SENDGRID', secretKeys: ['RELAY_API_KEY'] })
+    : coreSendViaSendGrid;
+  const sendViaResend = hasPlugin('resend')
+    ? (from, to, rawInput) => invokePlugin('resend', 'deliver', { requestId: `resend-${Date.now()}`, payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64') } }, { configPrefix: 'RESEND', secretKeys: ['RELAY_API_KEY'] })
+    : coreSendViaResend;
+  const sendViaMailgun = hasPlugin('mailgun')
+    ? (from, to, rawInput) => invokePlugin('mailgun', 'deliver', { requestId: `mailgun-${Date.now()}`, payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64') } }, { configPrefix: 'MAILGUN', secretKeys: ['RELAY_API_KEY'] })
+    : coreSendViaMailgun;
   const sendViaUpstream = createUpstreamEmailDelivery({
     defaultProvider: configuredUpstreamProvider,
     sendgridDelivery: sendViaSendGrid,
@@ -160,12 +208,17 @@ async function start() {
     postmarkUrl: process.env.POSTMARK_SPAMCHECK_URL,
     log: logVerbose
   });
-  const aiClassifier = createAiClassifier({
-    log: logVerbose
-  });
-  const spamhausClient = createSpamhausClient({
-    log: logVerbose
-  });
+  const aiClassifier = hasPlugin('codex')
+    ? {
+      classify: (rawEmail, requestId) => invokePlugin('codex', 'scan', { requestId, payload: { rawEmail } }, { configPrefix: 'AI', secretKeys: ['AI_API_KEY'] }),
+      enabled: true
+    }
+    : createAiClassifier({ log: logVerbose });
+  const spamhausClient = hasPlugin('spamhaus')
+    ? {
+      checkMessage: (message) => invokePlugin('spamhaus', 'scan', { requestId: message.requestId, payload: message }, { configPrefix: 'SPAMHAUS', secretKeys: ['SPAMHAUS_USERNAME', 'SPAMHAUS_PASSWORD'] })
+    }
+    : createSpamhausClient({ log: logVerbose });
   const inboundMessageDecryptor = createInboundMessageDecryptor();
 
   const queueManager = createQueueManager({
