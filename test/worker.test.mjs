@@ -79,3 +79,27 @@ test('worker send endpoint rejects invalid secret before sending', async () => {
 
   assert.equal(response.status, 403);
 });
+
+test('worker send endpoint prefers the dedicated outbound webhook secret', async () => {
+  let sendCalls = 0;
+  const response = await worker.fetch(new Request('https://worker.example/api/send/email', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Webhook-Secret': 'outbound-secret'
+    },
+    body: JSON.stringify({ from: 'sender@example.com', to: ['dest@example.com'] })
+  }), {
+    WEBHOOK_SECRET: 'inbound-secret',
+    CLOUDFLARE_SEND_WEBHOOK_SECRET: 'outbound-secret',
+    EMAIL: {
+      async send() {
+        sendCalls += 1;
+        return { messageId: 'message-2' };
+      }
+    }
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(sendCalls, 1);
+});

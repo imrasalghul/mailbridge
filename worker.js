@@ -154,10 +154,11 @@ async function handleSendEmailRequest(request, env) {
   if (!env.EMAIL?.send) {
     return jsonResponse({ error: "EMAIL binding is not configured" }, 500);
   }
-  if (!env.WEBHOOK_SECRET) {
-    return jsonResponse({ error: "WEBHOOK_SECRET is not configured" }, 500);
+  const sendWebhookSecret = env.CLOUDFLARE_SEND_WEBHOOK_SECRET || env.WEBHOOK_SECRET;
+  if (!sendWebhookSecret) {
+    return jsonResponse({ error: "CLOUDFLARE_SEND_WEBHOOK_SECRET or WEBHOOK_SECRET is not configured" }, 500);
   }
-  if (request.headers.get("X-Webhook-Secret") !== env.WEBHOOK_SECRET) {
+  if (request.headers.get("X-Webhook-Secret") !== sendWebhookSecret) {
     return jsonResponse({ error: "Invalid Secret" }, 403);
   }
 

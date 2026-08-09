@@ -127,7 +127,31 @@ MAILBRIDGE_PUBLIC_KEY_PEM
 
 ## Bootstrap Configuration
 
-For a new deployment, the easiest setup path is:
+For a new deployment, run the interactive setup assistant:
+
+```bash
+npm install
+npm run setup
+```
+
+It walks through the public hostname, private SMTP destination, spam mode, outbound provider, optional trusted SMTP relay, optional Cloudflare Tunnel, and Cloudflare resource names. Press Enter to accept each secure default.
+
+The command then:
+
+- creates `.env` and `wrangler.toml` without printing generated secrets
+- generates `QUEUE_MASTER_KEY` and both Worker webhook secrets
+- generates the RSA keypair under `secrets/` if one does not already exist
+- creates the local runtime directories
+- asks before overwriting an existing `.env` or `wrangler.toml`
+- prints the Cloudflare resource, secret-upload, deploy, and Docker commands to run next
+
+If the SMTP relay is enabled, the assistant requires TLS certificate/key paths by default. Plaintext relay traffic must be explicitly selected and remains CIDR-restricted.
+
+After setup, add the selected provider API key to `RELAY_API_KEY` in `.env` when using SendGrid, Resend, or Mailgun. For Mailgun, the assistant also asks for the sending domain; for Cloudflare Email Service, it asks for the deployed Worker send URL.
+
+### Manual bootstrap (advanced)
+
+The equivalent manual setup path is:
 
 1. Export a few deployment-specific values.
 2. Generate local secrets and the R2 encryption key pair.
@@ -213,6 +237,7 @@ cat > .env <<EOF
 PORT=3090
 SMTP_RELAY_PORT=2525
 SMTP_RELAY_SOCKET_TIMEOUT_MS=120000
+SMTP_RELAY_MAX_MESSAGE_BYTES=52428800
 MAILBRIDGE_VERBOSE_LOGGING=true
 MAILBRIDGE_HOSTNAME=${MAILBRIDGE_HOSTNAME}
 QUEUE_MAX_ATTEMPTS=20

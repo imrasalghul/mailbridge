@@ -43,6 +43,7 @@ function parseBoolean(value, defaultValue) {
 
 const port = Number.parseInt(process.env.PORT || '3090', 10);
 const smtpRelayPort = Number.parseInt(process.env.SMTP_RELAY_PORT || '2525', 10);
+const smtpRelayMaxMessageBytes = Number.parseInt(process.env.SMTP_RELAY_MAX_MESSAGE_BYTES || String(50 * 1024 * 1024), 10);
 const maxQueueAttempts = Number.parseInt(process.env.QUEUE_MAX_ATTEMPTS || '20', 10);
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const dbPath = path.join(dataDir, 'mailbridge.db');
@@ -517,6 +518,7 @@ async function start() {
     const smtpRelayServer = createSmtpRelayServer({
       verboseAppLogging,
       socketTimeoutMs: Number.parseInt(process.env.SMTP_RELAY_SOCKET_TIMEOUT_MS || '120000', 10),
+      maxMessageSizeBytes: smtpRelayMaxMessageBytes,
       logSmtpRelay,
       sendViaUpstream,
       addToQueue: queueManager.addToQueue,

@@ -66,3 +66,17 @@ test('webhook validation ignores generic body.ip so worker request IP is not tre
   assert.equal(result.messageSourceIp, '');
   assert.equal(result.requestIp, '2a06:98c0:3600::103');
 });
+
+test('webhook validation rejects non-string mail fields', () => {
+  const result = validateWebhookRequest({
+    headers: { 'x-webhook-secret': 'secret' },
+    body: {
+      from: { address: 'sender@example.com' },
+      to: 'dest@example.com',
+      raw: 'Subject: hi\r\n\r\nbody'
+    }
+  }, 'secret');
+
+  assert.equal(result.ok, false);
+  assert.equal(result.statusCode, 400);
+});

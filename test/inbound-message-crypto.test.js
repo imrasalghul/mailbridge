@@ -58,3 +58,26 @@ test('mailbridge rejects malformed encrypted payloads safely', () => {
     /Malformed encrypted payload/
   );
 });
+
+test('mailbridge rejects decrypted payloads with non-string mail fields', async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-r2-crypto-fields-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const privateKeyPath = path.join(tempDir, 'private.pem');
+  fs.writeFileSync(privateKeyPath, privateKey.export({ type: 'pkcs8', format: 'pem' }));
+  const encryptedPayload = await encryptPayloadWithPublicKey({
+    publicKeyPem: publicKey.export({ type: 'spki', format: 'pem' }),
+    payload: {
+      from: { address: 'sender@example.com' },
+      to: 'dest@example.com',
+      raw: 'Subject: hi\r\n\r\nbody'
+    }
+  });
+
+  const decryptor = createInboundMessageDecryptor({ privateKeyPath });
+  assert.throws(
+    () => decryptor.decryptPayload(encryptedPayload),
+    /missing required mail fields/
+  );
+});
