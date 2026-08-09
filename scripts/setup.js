@@ -95,7 +95,8 @@ function generateArtifacts(config, generated = {}) {
     DATA_DIR: config.dataDir || '/app/data',
     SECRETS_DB_PATH: config.secretsDbPath || '/app/secrets/secrets.db',
     MAILBRIDGE_PLUGIN_DIR: config.pluginDirectory || '/app/plugins',
-    MAILBRIDGE_PLUGIN_LOCKFILE: config.pluginLockfile || '/app/plugins.lock.json',
+    MAILBRIDGE_PLUGIN_LOCKFILE: config.pluginLockfile || '/app/data/plugins.lock.json',
+    MAILBRIDGE_PLUGIN_CONFIG_FILE: config.pluginConfigFile || '/app/data/plugins.config.json',
     QUEUE_MASTER_KEY: queueMasterKey,
     MAILBRIDGE_PRIVATE_KEY_PATH: config.privateKeyPath || '/app/secrets/mailbridge-r2-private.pem',
     AUDIT_LOG_RETENTION_DAYS: 1,
@@ -111,11 +112,7 @@ function generateArtifacts(config, generated = {}) {
     LOCAL_MAIL_TLS_SERVERNAME: config.localMailTlsServername || '',
     LOCAL_MAIL_TLS_CA_FILE: config.localMailTlsCaFile || '',
     RELAY_UPSTREAM_PROVIDER: config.upstreamProvider,
-    RELAY_API_KEY: '',
     RELAY_FROM_FALLBACK: config.relayFrom,
-    RESEND_BASE_URL: 'https://api.resend.com',
-    MAILGUN_DOMAIN: config.mailgunDomain || '',
-    MAILGUN_BASE_URL: 'https://api.mailgun.net',
     CLOUDFLARE_SEND_WORKER_URL: config.workerSendUrl || '',
     CLOUDFLARE_SEND_WEBHOOK_SECRET: cloudflareSendSecret,
     SMTP_RELAY_ENABLED: config.smtpRelayEnabled,
@@ -138,28 +135,18 @@ function generateArtifacts(config, generated = {}) {
     SA_QUESTIONABLE_THRESHOLD: 5,
     SPAM_SCL_SCORE: 9,
     SPAM_SUBJECT_TAG: '[SPAM]',
-    SPAMHAUS_ENABLED: false,
-    SPAMHAUS_USERNAME: '',
-    SPAMHAUS_PASSWORD: '',
-    SPAMHAUS_FAIL_OPEN: true,
-    AI_ENABLED: false,
-    AI_API_KEY: '',
-    AI_MODEL: 'gpt-5.4-nano',
-    AI_BASE_URL: '',
-    AI_INPUT_SCOPE: 'headers',
-    AI_MAX_INPUT_CHARS: 20000
+    ...(config.pluginSecretEnvironment || {})
   };
 
   const sections = [
-    ['Node App Configuration', ['PORT', 'SMTP_RELAY_PORT', 'SMTP_RELAY_SOCKET_TIMEOUT_MS', 'SMTP_RELAY_MAX_MESSAGE_BYTES', 'MAILBRIDGE_VERBOSE_LOGGING', 'MAILBRIDGE_HOSTNAME', 'QUEUE_MAX_ATTEMPTS', 'DATA_DIR', 'SECRETS_DB_PATH', 'MAILBRIDGE_PLUGIN_DIR', 'MAILBRIDGE_PLUGIN_LOCKFILE', 'QUEUE_MASTER_KEY', 'MAILBRIDGE_PRIVATE_KEY_PATH', 'AUDIT_LOG_RETENTION_DAYS']],
+    ['Node App Configuration', ['PORT', 'SMTP_RELAY_PORT', 'SMTP_RELAY_SOCKET_TIMEOUT_MS', 'SMTP_RELAY_MAX_MESSAGE_BYTES', 'MAILBRIDGE_VERBOSE_LOGGING', 'MAILBRIDGE_HOSTNAME', 'QUEUE_MAX_ATTEMPTS', 'DATA_DIR', 'SECRETS_DB_PATH', 'MAILBRIDGE_PLUGIN_DIR', 'MAILBRIDGE_PLUGIN_LOCKFILE', 'MAILBRIDGE_PLUGIN_CONFIG_FILE', 'QUEUE_MASTER_KEY', 'MAILBRIDGE_PRIVATE_KEY_PATH', 'AUDIT_LOG_RETENTION_DAYS']],
     ['Optional in-container Cloudflare Tunnel', ['CLOUDFLARED_ENABLED', 'CLOUDFLARED_TUNNEL_TOKEN', 'CLOUDFLARED_LOGLEVEL']],
     ['Shared Worker Authentication', ['WEBHOOK_SECRET']],
     ['Local Mail Server Configuration', ['LOCAL_MAIL_HOST', 'LOCAL_MAIL_PORT', 'LOCAL_MAIL_SECURE', 'LOCAL_MAIL_REQUIRE_TLS', 'LOCAL_MAIL_TLS_REJECT_UNAUTHORIZED', 'LOCAL_MAIL_TLS_SERVERNAME', 'LOCAL_MAIL_TLS_CA_FILE']],
-    ['Outbound Relay Provider Configuration', ['RELAY_UPSTREAM_PROVIDER', 'RELAY_API_KEY', 'RELAY_FROM_FALLBACK', 'RESEND_BASE_URL', 'MAILGUN_DOMAIN', 'MAILGUN_BASE_URL', 'CLOUDFLARE_SEND_WORKER_URL', 'CLOUDFLARE_SEND_WEBHOOK_SECRET']],
+    ['Outbound Relay Provider Configuration', ['RELAY_UPSTREAM_PROVIDER', 'RELAY_FROM_FALLBACK', 'CLOUDFLARE_SEND_WORKER_URL', 'CLOUDFLARE_SEND_WEBHOOK_SECRET']],
     ['SMTP Relay', ['SMTP_RELAY_ENABLED', 'SMTP_RELAY_VERBOSE_LOGGING', 'SMTP_RELAY_INJECT_HEADERS', 'SMTP_RELAY_REQUIRE_TLS', 'SMTP_RELAY_ALLOW_INSECURE', 'SMTP_RELAY_ALLOWED_CIDRS', 'SMTP_RELAY_TLS_CERT_FILE', 'SMTP_RELAY_TLS_KEY_FILE', 'SMTP_RELAY_TLS_CA_FILE']],
     ['Spam Filtering', ['SPAMASSASSIN_MODE', 'POSTMARK_SPAMCHECK_URL', 'SPAMD_HOST', 'SPAMD_PORT', 'SPAMD_STARTUP_ATTEMPTS', 'SPAMC_TIMEOUT_MS', 'SPAMC_FAIL_OPEN', 'SA_BLOCK_THRESHOLD', 'SA_QUESTIONABLE_THRESHOLD', 'SPAM_SCL_SCORE', 'SPAM_SUBJECT_TAG']],
-    ['Optional Spamhaus Intelligence API', ['SPAMHAUS_ENABLED', 'SPAMHAUS_USERNAME', 'SPAMHAUS_PASSWORD', 'SPAMHAUS_FAIL_OPEN']],
-    ['Optional AI Secondary Screening', ['AI_ENABLED', 'AI_API_KEY', 'AI_MODEL', 'AI_BASE_URL', 'AI_INPUT_SCOPE', 'AI_MAX_INPUT_CHARS']]
+    ['Plugin Settings', Object.keys(config.pluginSecretEnvironment || {})]
   ];
   const envText = sections.map(([label, keys]) => `# ${label}\n${keys.map((key) => `${key}=${envValue(env[key])}`).join('\n')}`).join('\n\n') + '\n';
   const wranglerText = `name = ${tomlValue(config.workerName)}\nmain = ${tomlValue(config.workerMain || 'worker.js')}\ncompatibility_date = "2026-05-19"\npreview_urls = false\n\n[vars]\nNODE_APP_URL = ${tomlValue(`https://${config.hostname}/api/webhook/email`)}\nMAIL_STORE_ENCRYPTION_VERSION = "v1"\n\n[[r2_buckets]]\nbinding = "MAIL_STORE"\nbucket_name = ${tomlValue(config.r2BucketName)}\n\n[[queues.producers]]\nbinding = "MAIL_QUEUE"\nqueue = ${tomlValue(config.queueName)}\n\n[[queues.consumers]]\nqueue = ${tomlValue(config.queueName)}\nmax_batch_size = 10\nmax_batch_timeout = 5\nmax_retries = 3\n\n[[send_email]]\nname = "EMAIL"\n`;
@@ -176,7 +163,7 @@ async function runSetup({
   dataDirectory = path.join(cwd, 'data'),
   runtimePaths = {},
   pluginDirectory = path.join(dataDirectory, 'plugins'),
-  pluginLockfile = path.join(cwd, 'plugins.lock.json'),
+  pluginLockfile = path.join(dataDirectory, 'plugins.lock.json'),
   systemMode = false
 } = {}) {
   const rl = readline.createInterface({ input, output });
@@ -210,7 +197,7 @@ async function runSetup({
     const pathContext = systemMode ? 'on this host' : 'inside container';
     const localMailTlsCaFile = localMailRequireTls ? await ask(`Custom CA file ${pathContext} (optional)`, '') : '';
     const spamAssassinMode = await askChoice('Spam filtering mode', ['local', 'postmark'], 'local');
-    const upstreamProvider = await askChoice('Outbound provider', ['sendgrid', 'resend', 'mailgun', 'cloudflare'], 'sendgrid');
+    let upstreamProvider = await askChoice('Outbound provider', ['sendgrid', 'resend', 'mailgun', 'cloudflare', 'community'], 'sendgrid');
     const targets = [envFileName, 'wrangler.toml'].map((name) => path.join(cwd, name));
     const existing = targets.filter((target) => fs.existsSync(target));
     if (existing.length && !await askBoolean(`Overwrite ${existing.map((file) => path.basename(file)).join(' and ')}`, false)) {
@@ -223,10 +210,27 @@ async function runSetup({
       log: (scope, message, details) => output.write(`${scope} ${message} ${JSON.stringify(details)}\n`)
     });
     const selectedPlugins = [];
+    const pluginConfiguration = {};
+    const pluginSecretEnvironment = {};
+    const promptPluginSchema = async (installed) => {
+      const fields = installed.manifest.config;
+      const names = Array.isArray(fields) ? fields : Object.keys(fields || {});
+      const values = {};
+      for (const name of names) {
+        const schema = Array.isArray(fields) ? {} : (fields[name] || {});
+        values[name] = await ask(`${installed.manifest.id} ${name}`, schema.default ?? '');
+      }
+      if (names.length) pluginConfiguration[installed.manifest.id] = values;
+      const secretFields = installed.manifest.secrets;
+      const secretNames = Array.isArray(secretFields) ? secretFields : Object.keys(secretFields || {});
+      const prefix = `MAILBRIDGE_PLUGIN_${installed.manifest.id.toUpperCase().replace(/-/g, '_')}_`;
+      for (const name of secretNames) pluginSecretEnvironment[`${prefix}${name}`] = await ask(`${installed.manifest.id} ${name} (secret)`, '');
+    };
     const installSelectedPlugin = async (label, defaultSpecifier) => {
       if (!await askBoolean(`Enable ${label} plugin`, false)) return;
       const specifier = assertExactPackageSpecifier(await ask(`Exact npm package/version for ${label}`, defaultSpecifier));
-      pluginManager.install(specifier);
+      const installed = pluginManager.install(specifier);
+      await promptPluginSchema(installed);
       selectedPlugins.push(label.toLowerCase());
     };
     await installSelectedPlugin('Spamhaus', 'mailbridge-plugin-spamhaus@1.0.0');
@@ -234,11 +238,24 @@ async function runSetup({
     if (['sendgrid', 'resend', 'mailgun'].includes(upstreamProvider)) {
       const pluginName = upstreamProvider[0].toUpperCase() + upstreamProvider.slice(1);
       const providerSpecifier = assertExactPackageSpecifier(await ask(`Exact npm package/version for ${pluginName}`, `mailbridge-plugin-${upstreamProvider}@1.0.0`));
-      pluginManager.install(providerSpecifier);
+      const installed = pluginManager.install(providerSpecifier);
+      await promptPluginSchema(installed);
       selectedPlugins.push(upstreamProvider);
+    } else if (upstreamProvider === 'community') {
+      const specifier = assertExactPackageSpecifier(await ask('Exact npm package/version for provider plugin'));
+      const installed = pluginManager.install(specifier);
+      if (installed.manifest.type !== 'provider') throw new Error(`${specifier} is not a provider plugin`);
+      await promptPluginSchema(installed);
+      upstreamProvider = installed.manifest.id;
+      selectedPlugins.push(installed.manifest.id);
+    }
+    while (await askBoolean('Install an additional community plugin', false)) {
+      const specifier = assertExactPackageSpecifier(await ask('Exact npm package/version for community plugin'));
+      const installed = pluginManager.install(specifier);
+      await promptPluginSchema(installed);
+      selectedPlugins.push(installed.manifest.id);
     }
     const relayFrom = await ask('Fallback outbound From address', `postmaster@${hostname}`);
-    const mailgunDomain = upstreamProvider === 'mailgun' ? await ask('Mailgun sending domain') : '';
     const workerSendUrl = upstreamProvider === 'cloudflare' ? await ask('Deployed Worker send URL') : '';
     const smtpRelayEnabled = await askBoolean('Enable the trusted outbound SMTP relay', false);
     const allowedCidrs = smtpRelayEnabled ? await ask('Allowed relay CIDRs', '127.0.0.1/32,::1/128') : '127.0.0.1/32,::1/128';
@@ -275,7 +292,8 @@ async function runSetup({
       keys = generateKeyPair();
     }
 
-    const artifacts = generateArtifacts({ hostname, workerName, localMailHost, localMailPort, localMailRequireTls, localMailTlsServername, localMailTlsCaFile, spamAssassinMode, upstreamProvider, relayFrom, mailgunDomain, workerSendUrl, smtpRelayEnabled, allowedCidrs, smtpRelayRequireTls, smtpRelayAllowInsecure, smtpRelayTlsCertFile, smtpRelayTlsKeyFile, smtpRelayTlsCaFile, cloudflaredEnabled, cloudflareTunnelToken, r2BucketName, queueName, pluginDirectory, pluginLockfile, ...runtimePaths }, { publicKey: keys?.publicKey || (fs.existsSync(publicKeyPath) ? fs.readFileSync(publicKeyPath, 'utf8') : '') });
+    const artifacts = generateArtifacts({ hostname, workerName, localMailHost, localMailPort, localMailRequireTls, localMailTlsServername, localMailTlsCaFile, spamAssassinMode, upstreamProvider, relayFrom, workerSendUrl, smtpRelayEnabled, allowedCidrs, smtpRelayRequireTls, smtpRelayAllowInsecure, smtpRelayTlsCertFile, smtpRelayTlsKeyFile, smtpRelayTlsCaFile, cloudflaredEnabled, cloudflareTunnelToken, r2BucketName, queueName, pluginDirectory, pluginLockfile, pluginConfigFile: path.join(path.dirname(pluginLockfile), 'plugins.config.json'), pluginSecretEnvironment, ...runtimePaths }, { publicKey: keys?.publicKey || (fs.existsSync(publicKeyPath) ? fs.readFileSync(publicKeyPath, 'utf8') : '') });
+    fs.writeFileSync(path.join(path.dirname(pluginLockfile), 'plugins.config.json'), `${JSON.stringify(pluginConfiguration, null, 2)}\n`, { mode: 0o644 });
     fs.mkdirSync(path.join(dataDirectory, 'queue'), { recursive: true, mode: 0o700 });
     fs.mkdirSync(keyDir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(targets[0], artifacts.envText, { mode: 0o600 });

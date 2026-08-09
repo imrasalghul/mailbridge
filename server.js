@@ -6,21 +6,16 @@ const fs = require('fs');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
 
-const { createAiClassifier } = require('./lib/ai-classifier');
 const { createAuditLogStore } = require('./lib/audit-log-store');
 const { createCloudflareDelivery } = require('./lib/cloudflare-delivery');
 const { extractDomainFromAddress } = require('./lib/email-metadata');
 const { createInboundMessageDecryptor } = require('./lib/inbound-message-crypto');
 const { createLocalMailTransport } = require('./lib/local-mail-transport');
 const { createPluginManager } = require('./lib/plugin-manager');
-const { createMailgunDelivery } = require('./lib/mailgun-delivery');
 const { createQueueCrypto } = require('./lib/queue-crypto');
 const { createQueueManager } = require('./lib/queue-manager');
 const { createQueueStore } = require('./lib/queue-store');
-const { createResendDelivery } = require('./lib/resend-delivery');
-const { createSendGridDelivery } = require('./lib/sendgrid-delivery');
 const { createSpamAssassinClient } = require('./lib/spamassassin-client');
-const { createSpamhausClient } = require('./lib/spamhaus-client');
 const {
   containsGtube,
   prependHeadersToRaw,
@@ -29,12 +24,6 @@ const {
 } = require('./lib/spam-pipeline');
 const { buildSmtpRelayPolicy } = require('./lib/smtp-relay-policy');
 const { createSmtpRelayServer } = require('./lib/smtp-relay-server');
-const { createUpstreamEmailDelivery } = require('./lib/upstream-email-delivery');
-const {
-  assertSupportedUpstreamProvider,
-  formatUpstreamProviderLabel,
-  isOutboundTarget
-} = require('./lib/upstream-provider');
 const { validateWebhookRequest } = require('./lib/webhook-intake');
 
 function parseBoolean(value, defaultValue) {
@@ -62,46 +51,75 @@ const verboseSmtpRelayLogging = parseBoolean(process.env.SMTP_RELAY_VERBOSE_LOGG
 const smtpRelayEnabled = parseBoolean(process.env.SMTP_RELAY_ENABLED, false);
 const smtpRelayInjectHeaders = parseBoolean(process.env.SMTP_RELAY_INJECT_HEADERS, true);
 const spamcFailOpen = parseBoolean(process.env.SPAMC_FAIL_OPEN, false);
-const configuredUpstreamProvider = assertSupportedUpstreamProvider(process.env.RELAY_UPSTREAM_PROVIDER || 'sendgrid');
-const relayApiKey = process.env.RELAY_API_KEY || '';
+const configuredUpstreamProvider = String(process.env.RELAY_UPSTREAM_PROVIDER || 'cloudflare').trim().toLowerCase();
 const relayFromFallback = process.env.RELAY_FROM_FALLBACK || process.env.SENDGRID_FROM_FALLBACK || 'postmaster@localhost';
 const pluginManager = createPluginManager({
-  pluginDirectory: process.env.MAILBRIDGE_PLUGIN_DIR || path.join(__dirname, 'plugins'),
-  lockfilePath: process.env.MAILBRIDGE_PLUGIN_LOCKFILE || path.join(__dirname, 'plugins.lock.json'),
+  pluginDirectory: process.env.MAILBRIDGE_PLUGIN_DIR || path.join(dataDir, 'plugins'),
+  lockfilePath: process.env.MAILBRIDGE_PLUGIN_LOCKFILE || path.join(dataDir, 'plugins.lock.json'),
   log: (...args) => logVerbose(...args)
 });
-
-function hasPlugin(id) {
-  try {
-    pluginManager.find(id);
-    return true;
-  } catch {
-    return false;
-  }
+let pluginConfigFile = {};
+try {
+  const configPath = process.env.MAILBRIDGE_PLUGIN_CONFIG_FILE || path.join(dataDir, 'plugins.config.json');
+  if (configPath && fs.existsSync(configPath)) pluginConfigFile = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+} catch (error) {
+  console.warn(`[Plugin] Ignoring invalid plugin config file: ${error.message}`);
 }
 
-function pluginSettings(prefix, excluded = []) {
-  return Object.fromEntries(Object.entries(process.env)
-    .filter(([key]) => key.startsWith(`${prefix}_`) && !excluded.includes(key))
-    .map(([key, value]) => [key.slice(prefix.length + 1), value]));
+function pluginEnvironment(manifest) {
+  const prefix = `MAILBRIDGE_PLUGIN_${manifest.id.toUpperCase().replace(/-/g, '_')}_`;
+  const fieldNames = (fields) => Array.isArray(fields) ? fields : Object.keys(fields || {});
+  const config = { ...(pluginConfigFile[manifest.id] || {}) };
+  const secrets = {};
+  for (const name of fieldNames(manifest.config)) if (process.env[`${prefix}${name}`] !== undefined) config[name] = process.env[`${prefix}${name}`];
+  for (const name of fieldNames(manifest.secrets)) {
+    if (process.env[`${prefix}${name}`] !== undefined) secrets[name] = process.env[`${prefix}${name}`];
+    else if (process.env[name] !== undefined) secrets[name] = process.env[name];
+  }
+  return { config, secrets };
 }
 
-async function invokePlugin(id, operation, payload, { configPrefix, configOverrides = {}, secretKeys = [] } = {}) {
-  const secrets = Object.fromEntries(secretKeys.map((key) => [key, process.env[key] || '']));
-  const response = await pluginManager.invoke(id, operation, {
-    requestId: payload.requestId,
-    payload: payload.payload
-  }, {
-    config: { ...(configPrefix ? pluginSettings(configPrefix, secretKeys) : {}), ...configOverrides },
-    secrets
-  });
-  if (!response.ok) {
-    const error = new Error(response.error || `Plugin ${id} failed`);
-    error.permanent = response.permanent;
-    error.statusCode = response.statusCode;
-    throw error;
+async function invokeCapability(type, capability, operation, payload) {
+  const plugins = pluginManager.discover()
+    .filter(({ manifest }) => manifest.type === type && manifest.capabilities.includes(capability))
+    .sort((a, b) => a.manifest.priority - b.manifest.priority || a.manifest.id.localeCompare(b.manifest.id));
+  const results = [];
+  for (const { manifest } of plugins) {
+    try {
+      const response = await pluginManager.invoke(manifest.id, operation, { requestId: `${payload.requestId}:${manifest.id}`, payload }, pluginEnvironment(manifest));
+      if (!response.ok) throw new Error(response.error || `Plugin ${manifest.id} failed`);
+      results.push({ plugin: manifest, result: response.result || {} });
+    } catch (error) {
+      if (manifest.failurePolicy === 'fail-closed') throw error;
+      console.warn(`[${payload.requestId}] Plugin ${manifest.id} failed open: ${error.message}`);
+    }
   }
-  return response.result;
+  return results;
+}
+
+async function applyMiddlewarePlugins({ requestId, from, to, rawEmail, sourceIp }) {
+  let current = { from, to, rawEmail };
+  const middleware = pluginManager.discover()
+    .filter(({ manifest }) => manifest.type === 'middleware')
+    .sort((a, b) => a.manifest.priority - b.manifest.priority || a.manifest.id.localeCompare(b.manifest.id));
+  for (const { manifest } of middleware) {
+    try {
+      const response = await pluginManager.invoke(manifest.id, 'transform', {
+        requestId: `${requestId}:${manifest.id}`,
+        payload: { ...current, sourceIp }
+      }, pluginEnvironment(manifest));
+      if (!response.ok) throw Object.assign(new Error(response.error || `Middleware ${manifest.id} failed`), { permanent: response.permanent });
+      const result = response.result || {};
+      if (result.action === 'reject') return { rejected: true, reason: result.reason || manifest.id };
+      if (typeof result.rawEmail === 'string') current.rawEmail = result.rawEmail;
+      if (typeof result.from === 'string') current.from = result.from;
+      if (typeof result.to === 'string') current.to = result.to;
+    } catch (error) {
+      if (manifest.failurePolicy === 'fail-closed') throw error;
+      console.warn(`[${requestId}] Middleware ${manifest.id} failed open: ${error.message}`);
+    }
+  }
+  return { rejected: false, ...current };
 }
 
 function logVerbose(scope, message, details = {}) {
@@ -152,30 +170,6 @@ async function start() {
   await queueStore.migrateLegacyQueue(legacyDbPath);
 
   const localMailTransport = createLocalMailTransport();
-  const coreSendViaSendGrid = createSendGridDelivery({
-    apiKey: relayApiKey,
-    injectHeaders: smtpRelayInjectHeaders,
-    relayHostname: mailbridgeHostname,
-    fromFallback: relayFromFallback,
-    log: logVerbose
-  });
-  const coreSendViaResend = createResendDelivery({
-    apiKey: relayApiKey,
-    baseUrl: process.env.RESEND_BASE_URL || 'https://api.resend.com',
-    injectHeaders: smtpRelayInjectHeaders,
-    relayHostname: mailbridgeHostname,
-    fromFallback: relayFromFallback,
-    log: logVerbose
-  });
-  const coreSendViaMailgun = createMailgunDelivery({
-    apiKey: relayApiKey,
-    domain: process.env.MAILGUN_DOMAIN,
-    baseUrl: process.env.MAILGUN_BASE_URL || 'https://api.mailgun.net',
-    injectHeaders: smtpRelayInjectHeaders,
-    relayHostname: mailbridgeHostname,
-    fromFallback: relayFromFallback,
-    log: logVerbose
-  });
   const sendViaCloudflare = createCloudflareDelivery({
     workerUrl: process.env.CLOUDFLARE_SEND_WORKER_URL,
     webhookSecret: process.env.CLOUDFLARE_SEND_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET,
@@ -184,22 +178,18 @@ async function start() {
     fromFallback: relayFromFallback,
     log: logVerbose
   });
-  const sendViaSendGrid = hasPlugin('sendgrid')
-    ? (from, to, rawInput) => invokePlugin('sendgrid', 'deliver', { requestId: `sendgrid-${Date.now()}`, payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64') } }, { configPrefix: 'SENDGRID', configOverrides: { INJECT_HEADERS: String(smtpRelayInjectHeaders), RELAY_HOSTNAME: mailbridgeHostname, RELAY_FROM_FALLBACK: relayFromFallback }, secretKeys: ['RELAY_API_KEY'] })
-    : coreSendViaSendGrid;
-  const sendViaResend = hasPlugin('resend')
-    ? (from, to, rawInput) => invokePlugin('resend', 'deliver', { requestId: `resend-${Date.now()}`, payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64') } }, { configPrefix: 'RESEND', configOverrides: { BASE_URL: process.env.RESEND_BASE_URL || 'https://api.resend.com', INJECT_HEADERS: String(smtpRelayInjectHeaders), RELAY_HOSTNAME: mailbridgeHostname, RELAY_FROM_FALLBACK: relayFromFallback }, secretKeys: ['RELAY_API_KEY'] })
-    : coreSendViaResend;
-  const sendViaMailgun = hasPlugin('mailgun')
-    ? (from, to, rawInput) => invokePlugin('mailgun', 'deliver', { requestId: `mailgun-${Date.now()}`, payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64') } }, { configPrefix: 'MAILGUN', configOverrides: { DOMAIN: process.env.MAILGUN_DOMAIN || '', BASE_URL: process.env.MAILGUN_BASE_URL || 'https://api.mailgun.net', INJECT_HEADERS: String(smtpRelayInjectHeaders), RELAY_HOSTNAME: mailbridgeHostname, RELAY_FROM_FALLBACK: relayFromFallback }, secretKeys: ['RELAY_API_KEY'] })
-    : coreSendViaMailgun;
-  const sendViaUpstream = createUpstreamEmailDelivery({
-    defaultProvider: configuredUpstreamProvider,
-    sendgridDelivery: sendViaSendGrid,
-    resendDelivery: sendViaResend,
-    mailgunDelivery: sendViaMailgun,
-    cloudflareDelivery: sendViaCloudflare
-  });
+  const sendViaUpstream = async ({ provider = configuredUpstreamProvider, from, to, rawInput }) => {
+    const providerId = String(provider || configuredUpstreamProvider).trim().toLowerCase();
+    if (providerId === 'cloudflare') return sendViaCloudflare(from, to, rawInput);
+    const { manifest } = pluginManager.find(providerId);
+    if (manifest.type !== 'provider') throw new Error(`Plugin ${providerId} is not an outbound provider`);
+    const response = await pluginManager.invoke(providerId, 'deliver', {
+      requestId: `${providerId}-${Date.now()}`,
+      payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64'), context: { relayHostname: mailbridgeHostname, injectHeaders: smtpRelayInjectHeaders, fromFallback: relayFromFallback } }
+    }, pluginEnvironment(manifest));
+    if (!response.ok) throw Object.assign(new Error(response.error || `Provider ${providerId} failed`), { permanent: response.permanent, statusCode: response.statusCode });
+    return response.result;
+  };
   const spamAssassinClient = createSpamAssassinClient({
     host: process.env.SPAMD_HOST || '127.0.0.1',
     port: Number.parseInt(process.env.SPAMD_PORT || '783', 10),
@@ -208,17 +198,10 @@ async function start() {
     postmarkUrl: process.env.POSTMARK_SPAMCHECK_URL,
     log: logVerbose
   });
-  const aiClassifier = hasPlugin('codex')
-    ? {
-      classify: (rawEmail, requestId) => invokePlugin('codex', 'scan', { requestId, payload: { rawEmail } }, { configPrefix: 'AI', secretKeys: ['AI_API_KEY'] }),
-      enabled: true
-    }
-    : createAiClassifier({ log: logVerbose });
-  const spamhausClient = hasPlugin('spamhaus')
-    ? {
-      checkMessage: (message) => invokePlugin('spamhaus', 'scan', { requestId: message.requestId, payload: message }, { configPrefix: 'SPAMHAUS', secretKeys: ['SPAMHAUS_USERNAME', 'SPAMHAUS_PASSWORD'] })
-    }
-    : createSpamhausClient({ log: logVerbose });
+  const classifyWithPlugins = async (rawEmail, requestId) => {
+    const results = await invokeCapability('scanner', 'classification', 'scan', { rawEmail, requestId });
+    return results.map(({ result }) => result).find((result) => result.spam === '1' || result.spam === '0') || null;
+  };
   const inboundMessageDecryptor = createInboundMessageDecryptor();
 
   const queueManager = createQueueManager({
@@ -226,8 +209,8 @@ async function start() {
     auditStore,
     maxQueueAttempts,
     async deliverQueuedMessage(row) {
-      if (isOutboundTarget(row.target)) {
-        const providerLabel = formatUpstreamProviderLabel(row.target);
+      if (row.target && row.target !== 'local_mail') {
+        const providerLabel = String(row.target);
         logSmtpRelay(`[Queue->${providerLabel}]`, 'Retrying delivery', {
           queueId: row.id,
           from: row.sender,
@@ -260,10 +243,10 @@ async function start() {
   });
   queueManager.start(5 * 60 * 1000);
 
-  async function logInboundAiEvent({ requestId, from, to, sourceIp, senderDomain, result, stage }) {
+  async function logClassificationEvent({ requestId, from, to, sourceIp, senderDomain, result, stage }) {
     await auditStore.logEvent({
       requestId,
-      eventType: 'ai_result',
+      eventType: 'classification_result',
       direction: 'inbound',
       target: 'local_mail',
       outcome: result?.spam === '1' ? 'spam' : result?.spam === '0' ? 'not_spam' : 'inconclusive',
@@ -327,27 +310,23 @@ async function start() {
 
     let isHardSpam = false;
     let isQuestionable = false;
-    let aiConfirmedSpam = false;
-    let aiClassification = null;
+    let pluginConfirmedSpam = false;
+    let pluginClassification = null;
     let spamSource = 'spamassassin';
     let spamReason = 'clean';
     let spamScore = null;
     const gtubeDetected = containsGtube(raw);
 
     try {
-      const reputationCheck = await spamhausClient.checkMessage({
-        senderIp: sourceIp,
-        envelopeFrom: from,
-        rawEmail: raw,
-        requestId
-      });
+      const reputationResults = await invokeCapability('scanner', 'reputation', 'scan', { senderIp: sourceIp, envelopeFrom: from, rawEmail: raw, requestId });
+      const reputationCheck = reputationResults.map(({ result }) => result).find((result) => result.blocked) || {};
       const senderDomain = reputationCheck.senderDomain || extractDomainFromAddress(from);
 
       if (reputationCheck.blocked) {
-        console.warn(`[${requestId}] Rejected sender due to Spamhaus listing. ipHit=${reputationCheck.ipHit} domainHit=${reputationCheck.domainHit} domain=${senderDomain || 'n/a'}`);
+        console.warn(`[${requestId}] Rejected sender by reputation plugin. domain=${senderDomain || 'n/a'}`);
         await auditStore.logEvent({
           requestId,
-          eventType: 'spamhaus_blocked',
+          eventType: 'reputation_plugin_blocked',
           direction: 'inbound',
           target: 'local_mail',
           outcome: 'blocked',
@@ -361,7 +340,7 @@ async function start() {
             datasets: reputationCheck.datasets || []
           }
         });
-        return res.status(406).send('Rejected by Spamhaus reputation filter');
+        return res.status(406).send('Rejected by reputation filter');
       }
 
       let spamAssassinResult;
@@ -369,26 +348,26 @@ async function start() {
         spamAssassinResult = await spamAssassinClient.checkMessage(raw, requestId);
         spamScore = spamAssassinResult.score;
       } catch (spamError) {
-        console.warn(`[${requestId}] ${spamError.message}. Falling back to AI classification.`);
-        spamSource = 'ai-fallback';
-        const aiFallback = await aiClassifier.classify(raw, requestId);
-        await logInboundAiEvent({
+        console.warn(`[${requestId}] ${spamError.message}. Falling back to classification plugins.`);
+        spamSource = 'plugin-fallback';
+        const classificationFallback = await classifyWithPlugins(raw, requestId);
+        await logClassificationEvent({
           requestId,
           from,
           to,
           sourceIp,
           senderDomain,
-          result: aiFallback,
+          result: classificationFallback,
           stage: 'fallback'
         });
-        aiClassification = aiFallback;
-        if (aiFallback?.spam === '1') {
-          aiConfirmedSpam = true;
-          spamReason = 'ai_fallback_spam';
-        } else if (aiFallback?.spam === '0') {
-          spamReason = 'ai_fallback_not_spam';
+        pluginClassification = classificationFallback;
+        if (classificationFallback?.spam === '1') {
+          pluginConfirmedSpam = true;
+          spamReason = 'plugin_fallback_spam';
+        } else if (classificationFallback?.spam === '0') {
+          spamReason = 'plugin_fallback_not_spam';
         } else if (!spamcFailOpen) {
-          console.error(`[${requestId}] SpamAssassin and AI unavailable. Rejecting inbound mail (SPAMC_FAIL_OPEN=false).`);
+          console.error(`[${requestId}] SpamAssassin and classification plugins unavailable. Rejecting inbound mail (SPAMC_FAIL_OPEN=false).`);
           await auditStore.logEvent({
             requestId,
             eventType: 'delivery_failed',
@@ -399,11 +378,11 @@ async function start() {
             recipient: to,
             sourceIp,
             senderDomain,
-            errorMessage: 'SpamAssassin and AI unavailable'
+            errorMessage: 'SpamAssassin and classification plugins unavailable'
           });
           return res.status(503).send('Spam filter unavailable');
         } else {
-          console.warn(`[${requestId}] SpamAssassin and AI unavailable. Continuing with fail-open behavior (SPAMC_FAIL_OPEN=true).`);
+          console.warn(`[${requestId}] SpamAssassin and classification plugins unavailable. Continuing with fail-open behavior (SPAMC_FAIL_OPEN=true).`);
           spamReason = 'fail_open';
         }
         spamAssassinResult = { score: 0 };
@@ -428,52 +407,52 @@ async function start() {
       }
 
       if (isQuestionable) {
-        const aiResult = await aiClassifier.classify(raw, requestId);
-        await logInboundAiEvent({
+        const classificationResult = await classifyWithPlugins(raw, requestId);
+        await logClassificationEvent({
           requestId,
           from,
           to,
           sourceIp,
           senderDomain,
-          result: aiResult,
+          result: classificationResult,
           stage: 'questionable'
         });
-        aiClassification = aiResult;
-        spamSource = 'spamassassin+ai';
-        if (aiResult?.spam === '1') {
-          aiConfirmedSpam = true;
-          spamReason = 'sa_questionable_ai_spam';
-        } else if (aiResult?.spam === '0') {
-          spamReason = 'sa_questionable_ai_not_spam';
+        pluginClassification = classificationResult;
+        spamSource = 'spamassassin+plugin';
+        if (classificationResult?.spam === '1') {
+          pluginConfirmedSpam = true;
+          spamReason = 'sa_questionable_plugin_spam';
+        } else if (classificationResult?.spam === '0') {
+          spamReason = 'sa_questionable_plugin_not_spam';
         } else {
-          spamReason = 'sa_questionable_ai_inconclusive';
+          spamReason = 'sa_questionable_plugin_inconclusive';
         }
 
-        logVerbose('[Spam]', 'AI classification executed', {
+        logVerbose('[Spam]', 'Classification plugin executed', {
         requestId,
-        aiResult: aiResult?.spam || null,
-        aiReason: aiResult?.reason || null,
-        aiScore: aiResult?.score ?? null,
-        aiConfirmedSpam
+        classificationResult: classificationResult?.spam || null,
+        pluginReason: classificationResult?.reason || null,
+        pluginScore: classificationResult?.score ?? null,
+        pluginConfirmedSpam
       });
     }
 
-      if (!isHardSpam && !isQuestionable && !aiConfirmedSpam) {
+      if (!isHardSpam && !isQuestionable && !pluginConfirmedSpam) {
         spamReason = 'sa_clean';
       }
 
-      const finalSpamVerdict = isHardSpam || aiConfirmedSpam;
-      const mailbridgeProbabilityScore = aiClassification?.score ?? null;
+      const finalSpamVerdict = isHardSpam || pluginConfirmedSpam;
+      const mailbridgeProbabilityScore = pluginClassification?.score ?? null;
       const mailbridgeReason = finalSpamVerdict
-        ? aiClassification?.spam === '1'
-          ? aiClassification.reason
+        ? pluginClassification?.spam === '1'
+          ? pluginClassification.reason
           : gtubeDetected
             ? 'gtube'
             : isHardSpam
               ? 'spam_score'
               : 'spam'
-        : aiClassification?.spam === '0'
-          ? aiClassification.reason
+        : pluginClassification?.spam === '0'
+          ? pluginClassification.reason
           : 'not_spam';
       logVerbose('[Spam]', 'Final verdict resolved', {
         requestId,
@@ -484,8 +463,8 @@ async function start() {
         spamSource,
         spamScore,
         gtubeDetected,
-        aiReason: aiClassification?.reason || null,
-        aiScore: aiClassification?.score ?? null
+        pluginReason: pluginClassification?.reason || null,
+        pluginScore: pluginClassification?.score ?? null
       });
 
       const headers = buildInboundHeaders({
@@ -498,22 +477,30 @@ async function start() {
         spamScore,
         finalSpamVerdict,
         spamSclScore,
-        aiConfirmedSpam
+        pluginConfirmedSpam
       });
 
       const taggedRaw = applySpamSubjectTag(raw, finalSpamVerdict, spamSubjectTag);
       const finalRaw = prependHeadersToRaw(taggedRaw, headers);
+      const middlewareResult = await applyMiddlewarePlugins({ requestId, from, to, rawEmail: finalRaw, sourceIp });
+      if (middlewareResult.rejected) {
+        await auditStore.logEvent({ requestId, eventType: 'middleware_blocked', direction: 'inbound', target: 'local_mail', outcome: 'blocked', sender: from, recipient: to, sourceIp, errorMessage: middlewareResult.reason });
+        return res.status(406).send(`Rejected by middleware: ${middlewareResult.reason}`);
+      }
+      const transformedFrom = middlewareResult.from;
+      const transformedTo = middlewareResult.to;
+      const transformedRaw = middlewareResult.rawEmail;
       logVerbose('[Webhook]', 'Injected inbound local-mail headers', {
         requestId,
         isQuestionable,
-        aiConfirmedSpam,
+        pluginConfirmedSpam,
         injectedHeaderLines: headers.split('\r\n').filter(Boolean).length
       });
 
       try {
         await localMailTransport.sendMail({
-          envelope: { from, to: [to] },
-          raw: finalRaw
+          envelope: { from: transformedFrom, to: [transformedTo] },
+          raw: transformedRaw
         });
         await auditStore.logEvent({
           requestId,
@@ -550,7 +537,7 @@ async function start() {
         }
 
         console.warn(`[${requestId}] Local mail server offline/busy (${smtpCode || 'Timeout'}). Queueing...`);
-        await queueManager.addToQueue(from, to, finalRaw, 'local_mail', {
+        await queueManager.addToQueue(transformedFrom, transformedTo, transformedRaw, 'local_mail', {
           direction: 'inbound',
           requestId,
           sourceIp,

@@ -35,6 +35,7 @@ test('package scripts preserve configuration and queued mail across removal', ()
   assert.match(postinst, /adduser --system/);
   assert.match(postinst, /\/var\/lib\/mailbridge\/queue/);
   assert.match(postinst, /\/var\/lib\/mailbridge\/plugins/);
+  assert.match(postinst, /-o root -g mailbridge -m 0750 \/var\/lib\/mailbridge\/plugins/);
   assert.doesNotMatch(postrm, /rm\s+-rf|rm\s+-r/);
   assert.match(postrm, /prevent accidental queued-mail loss/);
   assert.match(setup, /scripts\/setup\.js --system/);

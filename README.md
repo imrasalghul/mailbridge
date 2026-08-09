@@ -59,6 +59,16 @@ The assistant creates `.env`, `wrangler.toml`, runtime directories, independent 
 
 Optional scanners and outbound providers are installed as exact-version plugins. For example, use `mailbridge-plugin-spamhaus@1.0.0`; unversioned packages, `latest`, and version ranges are rejected. Plugins run in supervised child processes and receive only their declared namespaced settings and secrets.
 
+Mailbridge discovers plugins from `MAILBRIDGE_PLUGIN_DIR` using `mailbridge-plugin.json`. A plugin declares one of three types:
+
+- `provider`: receives `deliver` with the SMTP envelope and base64 RFC822 message.
+- `scanner`: receives `scan`; capabilities such as `reputation` and `classification` determine when it runs.
+- `middleware`: receives `transform` and may return a modified RFC822 message/envelope or reject delivery. This supports header editing, attachment removal, text inspection, redaction, and similar processing.
+
+Middleware runs deterministically by manifest `priority`, then plugin ID. Plugins communicate over JSON Lines API version 1 and may also handle `init`, `health`, and `shutdown`. Configuration is namespaced in `MAILBRIDGE_PLUGIN_CONFIG_FILE`; secrets use `MAILBRIDGE_PLUGIN_<PLUGIN_ID>_<SECRET_NAME>`. Protected Mailbridge encryption and webhook secrets cannot be requested by a plugin. The setup assistant accepts exact-version community packages and prompts from manifest configuration/secret schemas.
+
+See [Plugin Development](docs/PLUGIN_DEVELOPMENT.md) for the complete manifest, protocol, and middleware contracts.
+
 Then run the Cloudflare commands printed by the assistant and start Mailbridge:
 
 ```bash

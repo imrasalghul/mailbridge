@@ -9,6 +9,7 @@ services:
     env_file: .env
     volumes:
       - "./data:/app/data"
+      - "./data/plugins:/app/data/plugins:ro"
       - "./secrets:/app/secrets"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3090/health"]

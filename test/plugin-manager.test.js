@@ -34,6 +34,11 @@ test('plugin manifests validate the host contract', () => {
   assert.equal(manifest.id, 'codex');
   assert.throws(() => normalizeManifest({ ...manifest, apiVersion: 2 }), /unsupported plugin API/);
   assert.throws(() => normalizeManifest({ ...manifest, type: 'unknown' }), /invalid plugin type/);
+  assert.throws(() => normalizeManifest({ ...manifest, entrypoint: '../escape.js' }), /inside the plugin directory/);
+  const schemaManifest = normalizeManifest({ ...manifest, config: { enabled: { type: 'boolean', default: true } }, secrets: { token: { type: 'secret' } } });
+  assert.equal(schemaManifest.config.enabled.default, true);
+  assert.equal(schemaManifest.secrets.token.type, 'secret');
+  assert.throws(() => normalizeManifest({ ...manifest, secrets: ['QUEUE_MASTER_KEY'] }), /protected secret/);
 });
 
 test('plugin manager discovers and invokes a child-process plugin with namespaced environment', async () => {
@@ -75,4 +80,14 @@ test('plugin process timeouts terminate hung plugins', async () => {
   fs.writeFileSync(path.join(pluginDirectory, 'mailbridge-plugin.json'), JSON.stringify(manifest));
   fs.writeFileSync(path.join(pluginDirectory, 'src/index.js'), 'setTimeout(() => {}, 10000);');
   await assert.rejects(() => runPluginProcess({ pluginDirectory, manifest, operation: 'scan', payload: { requestId: 'timeout' }, timeoutMs: 20 }), /timed out/);
+});
+
+test('middleware plugins can transform complete RFC822 messages', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-middleware-test-'));
+  const pluginDirectory = path.join(root, 'headers');
+  fs.mkdirSync(path.join(pluginDirectory, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(pluginDirectory, 'mailbridge-plugin.json'), JSON.stringify({ apiVersion: 1, id: 'headers', version: '1.0.0', type: 'middleware', failurePolicy: 'fail-closed', entrypoint: 'src/index.js', config: {}, secrets: {}, capabilities: ['raw_email'] }));
+  fs.writeFileSync(path.join(pluginDirectory, 'src/index.js'), `const readline=require('node:readline').createInterface({input:process.stdin});readline.once('line',(line)=>{const request=JSON.parse(line);process.stdout.write(JSON.stringify({requestId:request.requestId,ok:true,result:{action:'continue',rawEmail:'X-Community: yes\\r\\n'+request.payload.rawEmail}})+'\\n')})`);
+  const response = await createPluginManager({ pluginDirectory: root }).invoke('headers', 'transform', { requestId: 'middleware-1', payload: { rawEmail: 'Subject: test\r\n\r\nbody' } });
+  assert.equal(response.result.rawEmail, 'X-Community: yes\r\nSubject: test\r\n\r\nbody');
 });
