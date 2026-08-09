@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+
+exec /opt/mailbridge/node/bin/node /opt/mailbridge/app/server.js "$@"

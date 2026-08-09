@@ -1,0 +1,39 @@
+Origin: Alghul
+Label: Alghul Packages
+Codename: bullseye
+Suite: bullseye
+Architectures: amd64
+Components: main
+Description: Alghul packages for Debian 11
+
+Origin: Alghul
+Label: Alghul Packages
+Codename: bookworm
+Suite: bookworm
+Architectures: amd64
+Components: main
+Description: Alghul packages for Debian 12
+
+Origin: Alghul
+Label: Alghul Packages
+Codename: trixie
+Suite: trixie
+Architectures: amd64
+Components: main
+Description: Alghul packages for Debian 13
+
+Origin: Alghul
+Label: Alghul Packages
+Codename: noble
+Suite: noble
+Architectures: amd64
+Components: main
+Description: Alghul packages for Ubuntu 24.04 LTS
+
+Origin: Alghul
+Label: Alghul Packages
+Codename: resolute
+Suite: resolute
+Architectures: amd64
+Components: main
+Description: Alghul packages for Ubuntu 26.04 LTS

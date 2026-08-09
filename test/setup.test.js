@@ -47,9 +47,30 @@ test('interactive setup artifacts contain valid runtime and Worker configuration
   assert.match(artifacts.wranglerText, /^NODE_APP_URL = "https:\/\/mailbridge\.example\.com\/api\/webhook\/email"/m);
   assert.match(artifacts.wranglerText, /\[\[send_email\]\]\nname = "EMAIL"/);
   assert.doesNotMatch(artifacts.wranglerText, /webhook-secret|send-secret|queue-key/);
+  assert.equal(artifacts.publicKey, '');
+  assert.equal(artifacts.r2BucketName, 'mailbridge-inbound');
+  assert.equal(artifacts.queueName, 'mailbridge-inbound');
 });
 
 test('dotenv values with whitespace or comment characters are quoted', () => {
   assert.equal(envValue('simple.example'), 'simple.example');
   assert.equal(envValue('value with spaces # comment'), '"value with spaces # comment"');
+});
+
+test('setup artifacts support native Debian paths and packaged Worker entrypoint', () => {
+  const artifacts = generateArtifacts(baseConfig({
+    dataDir: '/var/lib/mailbridge',
+    secretsDbPath: '/var/lib/mailbridge/secrets.db',
+    privateKeyPath: '/etc/mailbridge/keys/mailbridge-r2-private.pem',
+    workerMain: '/opt/mailbridge/app/worker.js'
+  }), {
+    queueMasterKey: 'queue-key',
+    webhookSecret: 'webhook-secret',
+    cloudflareSendSecret: 'send-secret'
+  });
+
+  assert.match(artifacts.envText, /^DATA_DIR=\/var\/lib\/mailbridge$/m);
+  assert.match(artifacts.envText, /^SECRETS_DB_PATH=\/var\/lib\/mailbridge\/secrets\.db$/m);
+  assert.match(artifacts.envText, /^MAILBRIDGE_PRIVATE_KEY_PATH=\/etc\/mailbridge\/keys\/mailbridge-r2-private\.pem$/m);
+  assert.match(artifacts.wranglerText, /^main = "\/opt\/mailbridge\/app\/worker\.js"$/m);
 });

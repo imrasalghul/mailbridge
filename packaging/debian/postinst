@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+if ! getent group mailbridge >/dev/null; then
+  addgroup --system mailbridge
+fi
+
+if ! getent passwd mailbridge >/dev/null; then
+  adduser --system \
+    --ingroup mailbridge \
+    --home /var/lib/mailbridge \
+    --no-create-home \
+    --shell /usr/sbin/nologin \
+    mailbridge
+fi
+
+install -d -o root -g mailbridge -m 0750 /etc/mailbridge
+install -d -o mailbridge -g mailbridge -m 0750 /var/lib/mailbridge /var/lib/mailbridge/queue
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+if [ "$1" = "configure" ] && [ ! -f /etc/mailbridge/mailbridge.env ]; then
+  echo "Mailbridge installed but not configured."
+  echo "Run: sudo mailbridge-setup"
+fi
+
+exit 0

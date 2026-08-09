@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "mailbridge-setup must be run as root" >&2
+  exit 1
+fi
+
+/opt/mailbridge/node/bin/node /opt/mailbridge/app/scripts/setup.js --system
+
+chown root:mailbridge /etc/mailbridge/mailbridge.env /etc/mailbridge/wrangler.toml
+chmod 0640 /etc/mailbridge/mailbridge.env /etc/mailbridge/wrangler.toml
+chown -R mailbridge:mailbridge /etc/mailbridge/keys /var/lib/mailbridge
+chmod 0750 /etc/mailbridge/keys /var/lib/mailbridge /var/lib/mailbridge/queue
+chmod 0600 /etc/mailbridge/keys/mailbridge-r2-private.pem
+chmod 0644 /etc/mailbridge/keys/mailbridge-r2-public.pem
+
+systemctl daemon-reload
+
+echo
+echo "Configuration permissions updated for the mailbridge service."
+echo "Review /etc/mailbridge/mailbridge.env, then run:"
+echo "  systemctl enable --now mailbridge"

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+if [ "$1" = "purge" ]; then
+  echo "Mailbridge runtime data remains in /var/lib/mailbridge to prevent accidental queued-mail loss."
+  echo "Remove it manually only after confirming no recovery is needed."
+fi
+
+exit 0

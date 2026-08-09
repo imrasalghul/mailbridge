@@ -74,6 +74,42 @@ Expected response: `OK`.
 
 See the wiki [Quick Start](https://github.com/imrasalghul/mailbridge/wiki/Quick-Start) for resource creation, Worker secrets, deployment, and validation.
 
+## Debian, Ubuntu, and Proxmox Mail Gateway
+
+The amd64 package supports Debian 11-13, Ubuntu 24.04/26.04, and Debian-based Proxmox Mail Gateway installations. On a Proxmox VE virtualization host, install Mailbridge in a dedicated Debian LXC or VM instead of directly on the hypervisor.
+
+Install the repository signing key and select the current distribution codename:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://deb.alghul.com/gpg.key \
+  | sudo gpg --dearmor --yes -o /etc/apt/keyrings/mailbridge-archive-keyring.gpg
+
+. /etc/os-release
+case "$VERSION_CODENAME" in
+  bullseye|bookworm|trixie|noble|resolute) ;;
+  *) echo "Unsupported distribution: $VERSION_CODENAME" >&2; exit 1 ;;
+esac
+
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/mailbridge-archive-keyring.gpg] https://deb.alghul.com $VERSION_CODENAME main" \
+  | sudo tee /etc/apt/sources.list.d/mailbridge.list
+sudo apt-get update
+sudo apt-get install mailbridge
+```
+
+Run the interactive configuration assistant, review the generated settings, and start the service:
+
+```bash
+sudo mailbridge-setup
+sudoedit /etc/mailbridge/mailbridge.env
+sudo systemctl enable --now mailbridge
+sudo systemctl status mailbridge
+```
+
+The assistant creates the long runtime configuration, local encryption keys, queue secret, and Cloudflare Worker configuration. Follow its printed Wrangler commands to upload Worker secrets and deploy the Worker; never upload the generated private key.
+
 ## Security Defaults
 
 - Inbound R2 objects contain ciphertext, never plaintext mail.

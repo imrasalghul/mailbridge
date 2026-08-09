@@ -1,0 +1,17 @@
+Package: mailbridge
+Version: @VERSION@
+Section: mail
+Priority: optional
+Architecture: @ARCH@
+Maintainer: Ra's al Ghul <ras@alghul.com>
+Depends: adduser, ca-certificates, libc6 (>= 2.31), libstdc++6, systemd
+Recommends: spamd
+Homepage: https://github.com/imrasalghul/mailbridge
+Installed-Size: @INSTALLED_SIZE@
+Description: secure Cloudflare-to-private-SMTP mail gateway
+ Mailbridge receives encrypted inbound messages from Cloudflare Email
+ Routing, screens them, and delivers them to a private SMTP server. It can
+ also provide a CIDR-restricted outbound SMTP relay using provider APIs.
+ .
+ This package bundles a private Node.js 22 runtime and does not replace the
+ Node.js packages supplied by Debian or Proxmox.

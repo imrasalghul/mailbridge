@@ -1,0 +1,34 @@
+name: Debian package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-amd64:
+    runs-on: ubuntu-24.04
+    # Building on the oldest supported glibc keeps the native sqlite module
+    # usable on Debian 11-13 and Ubuntu 24.04-26.04.
+    container: debian:11-slim
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl dpkg-dev git g++ make python3 xz-utils
+      - uses: actions/checkout@v4
+      - name: Build package
+        run: packaging/debian/build-deb.sh
+      - name: Inspect package
+        run: |
+          dpkg-deb --info dist/debian/mailbridge_*_amd64.deb
+          dpkg-deb --contents dist/debian/mailbridge_*_amd64.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mailbridge-debian-amd64
+          path: dist/debian/mailbridge_*_amd64.deb
+          if-no-files-found: error

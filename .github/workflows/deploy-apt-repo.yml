@@ -1,0 +1,138 @@
+name: Publish APT repository
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      package_url:
+        description: Immutable HTTPS URL of a .deb from another project (optional)
+        required: false
+        type: string
+      package_sha256:
+        description: SHA-256 for package_url (required with package_url)
+        required: false
+        type: string
+  repository_dispatch:
+    types: [publish-deb]
+
+permissions:
+  contents: read
+
+# My projects publish through this workflow so R2 read-modify-write updates
+# cannot race each other.
+concurrency:
+  group: alghul-apt-repository
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    container: debian:11-slim
+    env:
+      GNUPGHOME: ${{ runner.temp }}/gnupg
+      RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
+      EXTERNAL_PACKAGE_URL: ${{ github.event.client_payload.package_url || inputs.package_url || '' }}
+      EXTERNAL_PACKAGE_SHA256: ${{ github.event.client_payload.package_sha256 || inputs.package_sha256 || '' }}
+    steps:
+      - name: Install tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl dpkg-dev git g++ gnupg make python3 reprepro rclone xz-utils
+
+      - uses: actions/checkout@v4
+
+      - name: Build or download package
+        run: |
+          set -Eeuo pipefail
+          mkdir -p dist/debian
+          if [ -n "$EXTERNAL_PACKAGE_URL" ]; then
+            case "$EXTERNAL_PACKAGE_URL" in https://*) ;; *) echo "package_url must use HTTPS" >&2; exit 2 ;; esac
+            [ -n "$EXTERNAL_PACKAGE_SHA256" ] || { echo "package_sha256 is required" >&2; exit 2; }
+            curl -fsSL --retry 3 -o dist/debian/external.deb "$EXTERNAL_PACKAGE_URL"
+            printf '%s  %s\n' "$EXTERNAL_PACKAGE_SHA256" dist/debian/external.deb | sha256sum -c -
+          else
+            packaging/debian/build-deb.sh
+          fi
+          for package in dist/debian/*.deb; do
+            dpkg-deb --info "$package"
+            [ "$(dpkg-deb --field "$package" Architecture)" = amd64 ] || { echo "Only amd64 is currently published" >&2; exit 2; }
+          done
+
+      - name: Import signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -Eeuo pipefail
+          [ -n "$GPG_PRIVATE_KEY" ] || { echo "GPG_PRIVATE_KEY is not configured" >&2; exit 2; }
+          mkdir -m 700 -p "$GNUPGHOME"
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          fingerprint="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+          [ -n "$fingerprint" ] || { echo "No secret signing key was imported" >&2; exit 2; }
+          printf 'GPG_FINGERPRINT=%s\n' "$fingerprint" >> "$GITHUB_ENV"
+
+      - name: Configure Cloudflare R2
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          set -Eeuo pipefail
+          for value in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET_NAME; do
+            [ -n "${!value}" ] || { echo "$value is not configured" >&2; exit 2; }
+          done
+          umask 077
+          cat > "$RCLONE_CONFIG" <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${R2_ACCESS_KEY_ID}
+          secret_access_key = ${R2_SECRET_ACCESS_KEY}
+          endpoint = https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+          acl = private
+          EOF
+          mkdir -p apt-repo
+          rclone sync "r2:${R2_BUCKET_NAME}" apt-repo --fast-list
+
+      - name: Update and sign distributions
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -Eeuo pipefail
+          install -D -m 0644 packaging/apt-repo/distributions apt-repo/conf/distributions
+          gpg --batch --armor --export "$GPG_FINGERPRINT" > apt-repo/gpg.key
+
+          for package in dist/debian/*.deb; do
+            name="$(dpkg-deb --field "$package" Package)"
+            version="$(dpkg-deb --field "$package" Version)"
+            for codename in bullseye bookworm trixie noble resolute; do
+              if reprepro -b apt-repo list "$codename" | grep -Fq ": ${name} ${version}"; then
+                echo "$name $version already exists in $codename; preserving the immutable package"
+              else
+                reprepro -b apt-repo includedeb "$codename" "$package"
+              fi
+            done
+          done
+
+          for codename in bullseye bookworm trixie noble resolute; do
+            release="apt-repo/dists/${codename}/Release"
+            rm -f "${release}.gpg" "apt-repo/dists/${codename}/InRelease"
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+              --local-user "$GPG_FINGERPRINT" --armor --detach-sign -o "${release}.gpg" "$release"
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+              --local-user "$GPG_FINGERPRINT" --armor --clearsign -o "apt-repo/dists/${codename}/InRelease" "$release"
+          done
+
+      - name: Upload repository to R2
+        env:
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: rclone sync apt-repo "r2:${R2_BUCKET_NAME}" --fast-list
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: published-debian-packages
+          path: dist/debian/*.deb
+          if-no-files-found: error
