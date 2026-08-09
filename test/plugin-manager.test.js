@@ -100,3 +100,16 @@ test('runtime discovery enforces an existing plugin lockfile', () => {
   fs.writeFileSync(path.join(root, 'plugins.lock.json'), JSON.stringify({ apiVersion: 1, plugins: {} }));
   assert.deepEqual(createPluginManager({ pluginDirectory: root, lockfilePath: path.join(root, 'plugins.lock.json') }).discover(), []);
 });
+
+test('plugin removal keeps the non-secret lockfile readable by the runtime user', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-remove-test-'));
+  const pluginDirectory = path.join(root, 'remove-me');
+  const lockfilePath = path.join(root, 'plugins.lock.json');
+  fs.mkdirSync(pluginDirectory, { recursive: true });
+  fs.writeFileSync(path.join(pluginDirectory, 'mailbridge-plugin.json'), JSON.stringify({ apiVersion: 1, id: 'remove-me', version: '1.0.0', type: 'middleware', failurePolicy: 'fail-open', entrypoint: 'index.js', config: {}, secrets: {} }));
+  fs.writeFileSync(lockfilePath, JSON.stringify({ apiVersion: 1, plugins: { 'remove-me': { package: 'remove-me', version: '1.0.0', integrity: 'sha512-test' } } }));
+  const manager = createPluginManager({ pluginDirectory: root, lockfilePath });
+  assert.deepEqual(manager.remove('remove-me'), { id: 'remove-me', removed: true });
+  assert.equal(fs.statSync(lockfilePath).mode & 0o777, 0o644);
+  assert.equal(manager.loadLockfile().plugins['remove-me'], undefined);
+});
