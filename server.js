@@ -86,13 +86,13 @@ function pluginSettings(prefix, excluded = []) {
     .map(([key, value]) => [key.slice(prefix.length + 1), value]));
 }
 
-async function invokePlugin(id, operation, payload, { configPrefix, secretKeys = [] } = {}) {
+async function invokePlugin(id, operation, payload, { configPrefix, configOverrides = {}, secretKeys = [] } = {}) {
   const secrets = Object.fromEntries(secretKeys.map((key) => [key, process.env[key] || '']));
   const response = await pluginManager.invoke(id, operation, {
     requestId: payload.requestId,
     payload: payload.payload
   }, {
-    config: configPrefix ? pluginSettings(configPrefix, secretKeys) : {},
+    config: { ...(configPrefix ? pluginSettings(configPrefix, secretKeys) : {}), ...configOverrides },
     secrets
   });
   if (!response.ok) {
@@ -185,13 +185,13 @@ async function start() {
     log: logVerbose
   });
   const sendViaSendGrid = hasPlugin('sendgrid')
-    ? (from, to, rawInput) => invokePlugin('sendgrid', 'deliver', { requestId: `sendgrid-${Date.now()}`, payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64') } }, { configPrefix: 'SENDGRID', secretKeys: ['RELAY_API_KEY'] })
+    ? (from, to, rawInput) => invokePlugin('sendgrid', 'deliver', { requestId: `sendgrid-${Date.now()}`, payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64') } }, { configPrefix: 'SENDGRID', configOverrides: { INJECT_HEADERS: String(smtpRelayInjectHeaders), RELAY_HOSTNAME: mailbridgeHostname, RELAY_FROM_FALLBACK: relayFromFallback }, secretKeys: ['RELAY_API_KEY'] })
     : coreSendViaSendGrid;
   const sendViaResend = hasPlugin('resend')
-    ? (from, to, rawInput) => invokePlugin('resend', 'deliver', { requestId: `resend-${Date.now()}`, payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64') } }, { configPrefix: 'RESEND', secretKeys: ['RELAY_API_KEY'] })
+    ? (from, to, rawInput) => invokePlugin('resend', 'deliver', { requestId: `resend-${Date.now()}`, payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64') } }, { configPrefix: 'RESEND', configOverrides: { BASE_URL: process.env.RESEND_BASE_URL || 'https://api.resend.com', INJECT_HEADERS: String(smtpRelayInjectHeaders), RELAY_HOSTNAME: mailbridgeHostname, RELAY_FROM_FALLBACK: relayFromFallback }, secretKeys: ['RELAY_API_KEY'] })
     : coreSendViaResend;
   const sendViaMailgun = hasPlugin('mailgun')
-    ? (from, to, rawInput) => invokePlugin('mailgun', 'deliver', { requestId: `mailgun-${Date.now()}`, payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64') } }, { configPrefix: 'MAILGUN', secretKeys: ['RELAY_API_KEY'] })
+    ? (from, to, rawInput) => invokePlugin('mailgun', 'deliver', { requestId: `mailgun-${Date.now()}`, payload: { from, to, rawInput: Buffer.from(rawInput).toString('base64') } }, { configPrefix: 'MAILGUN', configOverrides: { DOMAIN: process.env.MAILGUN_DOMAIN || '', BASE_URL: process.env.MAILGUN_BASE_URL || 'https://api.mailgun.net', INJECT_HEADERS: String(smtpRelayInjectHeaders), RELAY_HOSTNAME: mailbridgeHostname, RELAY_FROM_FALLBACK: relayFromFallback }, secretKeys: ['RELAY_API_KEY'] })
     : coreSendViaMailgun;
   const sendViaUpstream = createUpstreamEmailDelivery({
     defaultProvider: configuredUpstreamProvider,
