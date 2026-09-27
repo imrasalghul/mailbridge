@@ -89,7 +89,7 @@ See the wiki [Quick Start](https://github.com/imrasalghul/mailbridge/wiki/Quick-
 
 ## Debian, Ubuntu, and Proxmox Mail Gateway
 
-The amd64 package supports Debian 11-13, Ubuntu 24.04/26.04, and Debian-based Proxmox Mail Gateway installations. On a Proxmox VE virtualization host, install Mailbridge in a dedicated Debian LXC or VM instead of directly on the hypervisor.
+The amd64 package and APT repository support Debian 13 (Trixie) only. Install Mailbridge in a dedicated Debian 13 LXC or VM instead of directly on the Proxmox VE virtualization host.
 
 Install the repository signing key and select the current distribution codename:
 
@@ -102,7 +102,7 @@ curl -fsSL https://deb.alghul.com/gpg.key \
 
 . /etc/os-release
 case "$VERSION_CODENAME" in
-  bullseye|bookworm|trixie|noble|resolute) ;;
+  trixie) ;;
   *) echo "Unsupported distribution: $VERSION_CODENAME" >&2; exit 1 ;;
 esac
 

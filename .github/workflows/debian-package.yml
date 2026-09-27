@@ -12,9 +12,8 @@ permissions:
 jobs:
   build-amd64:
     runs-on: ubuntu-24.04
-    # Building on the oldest supported glibc keeps the native sqlite module
-    # usable on Debian 11-13 and Ubuntu 24.04-26.04.
-    container: debian:11-slim
+    # Build against the only published target: Debian 13 (Trixie).
+    container: debian:trixie-slim
     steps:
       - name: Install build tools
         run: |

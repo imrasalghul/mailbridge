@@ -29,17 +29,16 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-24.04
-    container: debian:11-slim
+    container: debian:trixie-slim
     env:
       GNUPGHOME: ${{ runner.temp }}/gnupg
-      RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
       EXTERNAL_PACKAGE_URL: ${{ github.event.client_payload.package_url || inputs.package_url || '' }}
       EXTERNAL_PACKAGE_SHA256: ${{ github.event.client_payload.package_sha256 || inputs.package_sha256 || '' }}
     steps:
       - name: Install tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl dpkg-dev git g++ gnupg make python3 reprepro rclone xz-utils
+          apt-get install -y --no-install-recommends awscli ca-certificates curl dpkg-dev git g++ gnupg make python3 reprepro xz-utils
 
       - uses: actions/checkout@v4
 
@@ -73,42 +72,36 @@ jobs:
           [ -n "$fingerprint" ] || { echo "No secret signing key was imported" >&2; exit 2; }
           printf 'GPG_FINGERPRINT=%s\n' "$fingerprint" >> "$GITHUB_ENV"
 
-      - name: Configure Cloudflare R2
+      - name: Download existing repository from the R2 S3 API
         env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
         run: |
           set -Eeuo pipefail
-          for value in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET_NAME; do
+          for value in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY R2_ACCOUNT_ID R2_BUCKET_NAME; do
             [ -n "${!value}" ] || { echo "$value is not configured" >&2; exit 2; }
           done
-          umask 077
-          cat > "$RCLONE_CONFIG" <<EOF
-          [r2]
-          type = s3
-          provider = Cloudflare
-          access_key_id = ${R2_ACCESS_KEY_ID}
-          secret_access_key = ${R2_SECRET_ACCESS_KEY}
-          endpoint = https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
-          acl = private
-          EOF
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3api head-bucket --bucket "$R2_BUCKET_NAME" --endpoint-url "$endpoint"
           mkdir -p apt-repo
-          rclone sync "r2:${R2_BUCKET_NAME}" apt-repo --fast-list
+          aws s3 sync "s3://${R2_BUCKET_NAME}/" apt-repo/ --endpoint-url "$endpoint"
 
       - name: Update and sign distributions
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           set -Eeuo pipefail
+          GPG_PASSPHRASE="$(printf '%s' "$GPG_PASSPHRASE" | tr -d '\r\n')"
           install -D -m 0644 packaging/apt-repo/distributions apt-repo/conf/distributions
           gpg --batch --armor --export "$GPG_FINGERPRINT" > apt-repo/gpg.key
 
           for package in dist/debian/*.deb; do
             name="$(dpkg-deb --field "$package" Package)"
             version="$(dpkg-deb --field "$package" Version)"
-            for codename in bullseye bookworm trixie noble resolute; do
+            for codename in trixie; do
               if reprepro -b apt-repo list "$codename" | grep -Fq ": ${name} ${version}"; then
                 echo "$name $version already exists in $codename; preserving the immutable package"
               else
@@ -117,7 +110,7 @@ jobs:
             done
           done
 
-          for codename in bullseye bookworm trixie noble resolute; do
+          for codename in trixie; do
             release="apt-repo/dists/${codename}/Release"
             rm -f "${release}.gpg" "apt-repo/dists/${codename}/InRelease"
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
@@ -128,8 +121,15 @@ jobs:
 
       - name: Upload repository to R2
         env:
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        run: rclone sync apt-repo "r2:${R2_BUCKET_NAME}" --fast-list
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+        run: |
+          set -Eeuo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 sync apt-repo/ "s3://${R2_BUCKET_NAME}/" --endpoint-url "$endpoint"
 
       - uses: actions/upload-artifact@v4
         with:

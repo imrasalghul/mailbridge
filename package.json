@@ -1,6 +1,6 @@
 {
   "name": "mail-bridge",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Bridge Cloudflare Worker to a local mail server",
   "main": "server.js",
   "engines": {

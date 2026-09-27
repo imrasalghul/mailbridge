@@ -51,18 +51,22 @@ test('Debian builder pins and verifies the bundled Node runtime', () => {
   assert.match(builder, /dpkg-deb --root-owner-group --build/);
 });
 
-test('APT repository covers every supported Debian and Ubuntu codename', () => {
+test('APT repository publishes only Debian Trixie', () => {
   const distributions = read('packaging/apt-repo/distributions');
-  for (const codename of ['bullseye', 'bookworm', 'trixie', 'noble', 'resolute']) {
-    assert.match(distributions, new RegExp(`^Codename: ${codename}$`, 'm'));
-  }
+  assert.match(distributions, /^Codename: trixie$/m);
+  assert.doesNotMatch(distributions, /^Codename: (?:bullseye|bookworm|noble|resolute)$/m);
   assert.doesNotMatch(distributions, /^Architectures:.*arm64/m);
 });
 
 test('APT publisher preserves history and signs both repository metadata formats', () => {
   const workflow = read('.github/workflows/deploy-apt-repo.yml');
-  assert.match(workflow, /rclone sync \"r2:\$\{R2_BUCKET_NAME\}\" apt-repo/);
-  assert.doesNotMatch(workflow, /rclone sync[^\n]*\|\| true/);
+  assert.match(workflow, /aws s3 sync \"s3:\/\/\$\{R2_BUCKET_NAME\}\/\" apt-repo\//);
+  assert.match(workflow, /aws s3 sync apt-repo\/ \"s3:\/\/\$\{R2_BUCKET_NAME\}\/\"/);
+  assert.match(workflow, /\.r2\.cloudflarestorage\.com/);
+  assert.match(workflow, /aws s3api head-bucket/);
+  assert.match(workflow, /R2_ACCOUNT_ID: \$\{\{ vars\.R2_ACCOUNT_ID \}\}/);
+  assert.match(workflow, /R2_BUCKET_NAME: \$\{\{ vars\.R2_BUCKET_NAME \}\}/);
+  assert.doesNotMatch(workflow, /rclone/);
   assert.match(workflow, /--detach-sign/);
   assert.match(workflow, /--clearsign/);
   assert.match(workflow, /concurrency:/);
