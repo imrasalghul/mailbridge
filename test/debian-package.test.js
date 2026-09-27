@@ -66,6 +66,7 @@ test('APT publisher preserves history and signs both repository metadata formats
   assert.match(workflow, /aws s3api head-bucket/);
   assert.match(workflow, /R2_ACCOUNT_ID: \$\{\{ vars\.R2_ACCOUNT_ID \}\}/);
   assert.match(workflow, /R2_BUCKET_NAME: \$\{\{ vars\.R2_BUCKET_NAME \}\}/);
+  assert.doesNotMatch(workflow, /\$\{!value\}/);
   assert.doesNotMatch(workflow, /rclone/);
   assert.match(workflow, /--detach-sign/);
   assert.match(workflow, /--clearsign/);
