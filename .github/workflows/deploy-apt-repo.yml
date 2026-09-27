@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-24.04
     container: debian:trixie-slim
     env:
-      GNUPGHOME: ${{ runner.temp }}/gnupg
+      GNUPGHOME: /tmp/mailbridge-gnupg
       EXTERNAL_PACKAGE_URL: ${{ github.event.client_payload.package_url || inputs.package_url || '' }}
       EXTERNAL_PACKAGE_SHA256: ${{ github.event.client_payload.package_sha256 || inputs.package_sha256 || '' }}
     steps:
