@@ -4,6 +4,7 @@ compatibility_date = "2026-10-21"
 preview_urls = false
 
 [vars]
+MAILBRIDGE_BEHAVIOR_PROFILE = "modern"
 NODE_APP_URL = "https://mailbridge.example.com/api/webhook/email"
 MAIL_STORE_ENCRYPTION_VERSION = "v1"
 

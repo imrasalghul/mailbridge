@@ -10,10 +10,22 @@ fi
 
 chown root:mailbridge /etc/mailbridge/mailbridge.env /etc/mailbridge/wrangler.toml
 chmod 0640 /etc/mailbridge/mailbridge.env /etc/mailbridge/wrangler.toml
-chown -R mailbridge:mailbridge /etc/mailbridge/keys /var/lib/mailbridge
+chown mailbridge:mailbridge /var/lib/mailbridge
+chown -R mailbridge:mailbridge /etc/mailbridge/keys /var/lib/mailbridge/queue
+for database in /var/lib/mailbridge/*.db /var/lib/mailbridge/*.db-wal /var/lib/mailbridge/*.db-shm; do
+  if [ -f "$database" ]; then chown mailbridge:mailbridge "$database"; fi
+done
+if [ -d /var/lib/mailbridge/plugins ]; then
+  chown -R root:mailbridge /var/lib/mailbridge/plugins
+  chmod -R go-w /var/lib/mailbridge/plugins
+fi
 chmod 0750 /etc/mailbridge/keys /var/lib/mailbridge /var/lib/mailbridge/queue
-chmod 0600 /etc/mailbridge/keys/mailbridge-r2-private.pem
-chmod 0644 /etc/mailbridge/keys/mailbridge-r2-public.pem
+if [ -f /etc/mailbridge/keys/mailbridge-r2-private.pem ]; then
+  chmod 0600 /etc/mailbridge/keys/mailbridge-r2-private.pem
+fi
+if [ -f /etc/mailbridge/keys/mailbridge-r2-public.pem ]; then
+  chmod 0644 /etc/mailbridge/keys/mailbridge-r2-public.pem
+fi
 
 systemctl daemon-reload
 

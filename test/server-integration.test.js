@@ -10,7 +10,7 @@ const { once } = require('node:events');
 const { SMTPServer } = require('smtp-server');
 const { encryptPayloadWithPublicKey } = require('../lib/inbound-message-crypto');
 
-test('running backend authenticates, decrypts null senders, deduplicates, and maps SMTP failures', { timeout: 20000 }, async t => {
+for (const profile of ['legacy', 'modern']) test(`running ${profile} backend preserves delivery and authentication contracts`, { timeout: 20000 }, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-integration-'));
   const keys = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
   const privateKeyPath = path.join(root, 'fixture.pem');
@@ -18,6 +18,8 @@ test('running backend authenticates, decrypts null senders, deduplicates, and ma
   // Run the real sources with an isolated cwd and legacy-db location; never load a developer's .env or queue.
   fs.copyFileSync(path.join(__dirname, '..', 'server.js'), path.join(root, 'server.js'));
   fs.cpSync(path.join(__dirname, '..', 'lib'), path.join(root, 'lib'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'data'));
+  fs.writeFileSync(path.join(root, 'data', 'plugins.lock.json'), JSON.stringify({ apiVersion: 1, plugins: {} }));
   let smtpCode = 0;
   const messages = [];
   const smtp = new SMTPServer({ disabledCommands: ['AUTH', 'STARTTLS'],
@@ -40,7 +42,7 @@ test('running backend authenticates, decrypts null senders, deduplicates, and ma
       DATA_DIR: path.join(root, 'data'), SECRETS_DB_PATH: path.join(root, 'secrets.db'), MAILBRIDGE_PRIVATE_KEY_PATH: privateKeyPath,
       LOCAL_MAIL_HOST: '127.0.0.1', LOCAL_MAIL_PORT: String(smtp.server.address().port), LOCAL_MAIL_REQUIRE_TLS: 'false',
       SPAMD_HOST: '127.0.0.1', SPAMD_PORT: String(spamd.address().port), SMTP_RELAY_ENABLED: 'false',
-      MAILBRIDGE_VERBOSE_LOGGING: 'true' }
+      MAILBRIDGE_VERBOSE_LOGGING: 'true', ...(profile === 'modern' ? { MAILBRIDGE_BEHAVIOR_PROFILE: 'modern' } : {}) }
   });
   let logs = '';
   child.stdout.on('data', chunk => { logs += chunk; });
@@ -66,7 +68,16 @@ test('running backend authenticates, decrypts null senders, deduplicates, and ma
   assert.equal((await post({ encryptedPayload }, 'fixture-1', 'wrong')).status, 403);
   assert.equal((await post({ encryptedPayload })).status, 200);
   assert.equal((await post({ encryptedPayload })).status, 200);
-  assert.equal(messages.length, 1);
+  assert.equal(messages.length, profile === 'modern' ? 1 : 2);
+  assert.equal(fs.existsSync(path.join(root, 'data', 'delivery-receipts.db')), profile === 'modern');
+  assert.equal((await fetch(`http://127.0.0.1:${httpPort}/health`)).status, 200);
+  assert.equal((await fetch(`http://127.0.0.1:${httpPort}/api/plugins/status`)).status, 403);
+  const statusResponse = await fetch(`http://127.0.0.1:${httpPort}/api/plugins/status`, { headers: { 'X-Webhook-Secret': 'synthetic-webhook' } });
+  assert.equal(statusResponse.status, 200);
+  const status = await statusResponse.json();
+  assert.equal(status.profile, profile);
+  assert.equal(status.execution.active, 0);
+  assert.deepEqual(status.plugins, []);
   assert.equal(messages[0].from.address, '');
   assert.match(messages[0].raw, /Synthetic test body/);
   smtpCode = 550;
@@ -82,5 +93,12 @@ test('running backend authenticates, decrypts null senders, deduplicates, and ma
   const invalidJson = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"private":' });
   assert.equal(invalidJson.status, 400);
   assert.equal(await invalidJson.text(), 'Invalid JSON');
-  assert.equal(messages.length, 1);
+  assert.equal(messages.length, profile === 'modern' ? 1 : 2);
+  if (profile === 'modern') {
+    fs.writeFileSync(path.join(root, 'data', 'plugins.lock.json'), JSON.stringify({ apiVersion: 1, plugins: { missing: { version: '1.0.0', enabled: true, type: 'middleware', failurePolicy: 'fail-closed' } } }));
+    const health = await fetch(`http://127.0.0.1:${httpPort}/health`);
+    assert.equal(health.status, 503);
+    assert.equal((await post({ ...payload, raw: payload.raw + 'missing required plugin' }, 'plugin-unavailable')).status, 503);
+    assert.equal(messages.length, 1);
+  }
 });

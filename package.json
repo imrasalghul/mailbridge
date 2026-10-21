@@ -8,6 +8,7 @@
   },
   "scripts": {
     "setup": "node scripts/setup.js",
+    "plugins": "node scripts/plugins.js",
     "start": "node server.js",
     "test": "node --test"
   },

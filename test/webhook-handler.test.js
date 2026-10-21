@@ -5,17 +5,17 @@ const { once } = require('node:events');
 const { createWebhookHandler } = require('../lib/webhook-handler');
 const { createDeliveryReceiptStore } = require('../lib/delivery-receipts');
 
-async function harness(t, processWebhook) {
-  const receiptStore = createDeliveryReceiptStore({ dbPath: ':memory:' });
-  await receiptStore.init();
+async function harness(t, processWebhook, options = { receiptsEnabled: true }) {
+  const receiptStore = options.receiptsEnabled ? createDeliveryReceiptStore({ dbPath: ':memory:' }) : undefined;
+  if (receiptStore) await receiptStore.init();
   const app = express();
   app.use(express.json());
-  app.post('/email', createWebhookHandler({ webhookSecret: 'test-secret', receiptStore, processWebhook }));
+  app.post('/email', createWebhookHandler({ webhookSecret: 'test-secret', receiptStore, processWebhook, ...options }));
   const server = app.listen(0, '127.0.0.1');
   await once(server, 'listening');
   t.after(async () => {
     await new Promise(resolve => server.close(resolve));
-    await new Promise((resolve, reject) => receiptStore.db.close(error => error ? reject(error) : resolve()));
+    if (receiptStore) await new Promise((resolve, reject) => receiptStore.db.close(error => error ? reject(error) : resolve()));
   });
   return (body, secret = 'test-secret', id = 'object-1') => fetch(`http://127.0.0.1:${server.address().port}/email`, {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Webhook-Secret': secret, ...(id ? { 'X-Mailbridge-Delivery-Id': id } : {}) },
@@ -51,7 +51,7 @@ test('plain webhook calls without a delivery ID remain distinct deliveries', asy
   assert.equal(calls, 2);
 });
 
-test('encrypted legacy requests deduplicate by their immutable ciphertext', async t => {
+test('modern receipts deduplicate encrypted requests from older Workers by ciphertext', async t => {
   let calls = 0;
   const post = await harness(t, async () => { calls++; return { statusCode: 200, body: 'OK' }; });
   const body = { encryptedPayload: { version: 'v1', algorithm: 'test', wrappedKey: 'key', iv: 'iv', ciphertext: 'cipher' } };
@@ -69,5 +69,32 @@ test('encrypted retries keep their receipt identity while Worker delivery header
   assert.equal((await post(nextPayload, 'test-secret', 'second-object')).status, 200);
   assert.equal((await post(nextPayload, 'test-secret', null)).status, 200);
   assert.equal((await post(nextPayload, 'test-secret', 'new-worker-object')).status, 409);
+  assert.equal(calls, 2);
+});
+
+test('legacy webhook requests ignore delivery identities without a receipt store', async t => {
+  let calls = 0;
+  const post = await harness(t, async () => { calls++; return { statusCode: 200, body: 'OK' }; }, { receiptsEnabled: false });
+  const encryptedPayload = { version: 'v1', algorithm: 'test', wrappedKey: 'key', iv: 'iv', ciphertext: 'cipher' };
+  assert.equal((await post({ encryptedPayload }, 'test-secret', 'x'.repeat(513))).status, 200);
+  assert.equal((await post({ encryptedPayload }, 'test-secret', 'x'.repeat(513))).status, 200);
+  assert.equal((await post(payload, 'test-secret', 'same-object')).status, 200);
+  assert.equal((await post({ ...payload, raw: 'Another message' }, 'test-secret', 'same-object')).status, 200);
+  assert.equal(calls, 4);
+});
+
+test('webhook defaults to independent deliveries when compatibility settings are absent', async t => {
+  const names = ['MAILBRIDGE_BEHAVIOR_PROFILE', 'MAILBRIDGE_DELIVERY_RECEIPTS'];
+  const previous = names.map(name => process.env[name]);
+  names.forEach(name => { delete process.env[name]; });
+  t.after(() => names.forEach((name, index) => {
+    if (previous[index] === undefined) delete process.env[name];
+    else process.env[name] = previous[index];
+  }));
+  let calls = 0;
+  const post = await harness(t, async () => { calls++; return { statusCode: 200, body: 'OK' }; }, {});
+  const body = { encryptedPayload: { version: 'v1', algorithm: 'test', wrappedKey: 'key', iv: 'iv', ciphertext: 'cipher' } };
+  assert.equal((await post(body)).status, 200);
+  assert.equal((await post(body)).status, 200);
   assert.equal(calls, 2);
 });

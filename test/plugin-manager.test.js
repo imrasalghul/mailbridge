@@ -102,6 +102,34 @@ test('runtime discovery enforces an existing plugin lockfile', () => {
   assert.deepEqual(createPluginManager({ pluginDirectory: root, lockfilePath: path.join(root, 'plugins.lock.json') }).discover(), []);
 });
 
+test('legacy locked plugins retain existing directory names that differ from their IDs', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-legacy-plugin-path-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const installed = path.join(root, 'custom-folder');
+  fs.mkdirSync(installed);
+  fs.writeFileSync(path.join(installed, 'mailbridge-plugin.json'), JSON.stringify({ apiVersion: 1, id: 'legacy', version: '1.0.0', type: 'scanner', failurePolicy: 'fail-closed', entrypoint: 'index.js', config: [], secrets: [] }));
+  const lockfilePath = path.join(root, 'plugins.lock.json');
+  fs.writeFileSync(lockfilePath, JSON.stringify({ apiVersion: 1, plugins: { legacy: { version: '1.0.0' } } }));
+  const manager = createPluginManager({ pluginDirectory: root, lockfilePath });
+  assert.equal(manager.find('legacy').directory, installed);
+  manager.disable('legacy');
+  manager.enable('legacy');
+  assert.equal(manager.find('legacy').directory, installed);
+});
+
+test('disabling one legacy loose plugin keeps other previously active plugins enabled', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-legacy-plugin-enable-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const id of ['first', 'second']) {
+    const installed = path.join(root, id);
+    fs.mkdirSync(installed);
+    fs.writeFileSync(path.join(installed, 'mailbridge-plugin.json'), JSON.stringify({ apiVersion: 1, id, version: '1.0.0', type: 'scanner', failurePolicy: 'fail-closed', entrypoint: 'index.js', config: [], secrets: [] }));
+  }
+  const manager = createPluginManager({ pluginDirectory: root });
+  manager.disable('first');
+  assert.deepEqual(manager.discover().map(plugin => plugin.manifest.id), ['second']);
+});
+
 test('plugin removal keeps the non-secret lockfile readable by the runtime user', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-remove-test-'));
   const pluginDirectory = path.join(root, 'remove-me');

@@ -132,11 +132,12 @@ test('Worker retries infrastructure failures and discards only explicit mail rej
 
 test('R2 cleanup retries carry the same identity and cannot resend an accepted delivery', async t => {
   const { state, env, msg } = queueFixture();
+  env.MAILBRIDGE_BEHAVIOR_PROFILE = 'modern';
   const receipts = createDeliveryReceiptStore({ dbPath: ':memory:' });
   await receipts.init();
   t.after(() => new Promise((resolve, reject) => receipts.db.close(error => error ? reject(error) : resolve())));
   let delivered = 0;
-  const handler = createWebhookHandler({ webhookSecret: 'test-secret', receiptStore: receipts,
+  const handler = createWebhookHandler({ webhookSecret: 'test-secret', receiptStore: receipts, receiptsEnabled: true,
     processWebhook: async () => { delivered++; return { statusCode: 200, body: 'OK' }; } });
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     const headers = Object.fromEntries(new Headers(options.headers));
@@ -181,4 +182,62 @@ test('R2 recovery requires inbound authentication and only requeues encrypted ob
   env.MAIL_STORE.get = async () => ({ customMetadata: {}, text: async () => 'plaintext mail' });
   assert.equal((await worker.fetch(request('test-secret'), env)).status, 422);
   assert.equal(sent.length, 1);
+});
+
+test('Worker transport keeps legacy redirects and has no implicit timeout until opted in', async t => {
+  const cases = [
+    { settings: {}, redirect: 'follow', timeout: undefined },
+    { settings: { MAILBRIDGE_BEHAVIOR_PROFILE: 'legacy' }, redirect: 'follow', timeout: undefined },
+    { settings: { MAILBRIDGE_BEHAVIOR_PROFILE: 'modern' }, redirect: 'error', timeout: 120000 },
+    { settings: { MAILBRIDGE_HTTP_ALLOW_REDIRECTS: 'false', MAILBRIDGE_HTTP_TIMEOUT_MS: '45000' }, redirect: 'error', timeout: 45000 },
+    { settings: { MAILBRIDGE_BEHAVIOR_PROFILE: 'modern', MAILBRIDGE_HTTP_ALLOW_REDIRECTS: 'true', MAILBRIDGE_HTTP_TIMEOUT_MS: '0' }, redirect: 'follow', timeout: undefined }
+  ];
+  for (const { settings, redirect, timeout } of cases) {
+    const { state, env, msg } = queueFixture();
+    Object.assign(env, settings);
+    let timeoutValue;
+    const controller = new AbortController();
+    t.mock.method(AbortSignal, 'timeout', value => { timeoutValue = value; return controller.signal; });
+    t.mock.method(globalThis, 'fetch', async (url, options) => {
+      assert.equal(options.redirect, redirect);
+      assert.equal(options.signal, timeout === undefined ? undefined : controller.signal);
+      return new Response('OK');
+    });
+    await worker.queue({ messages: [msg] }, env);
+    assert.deepEqual(state, { deleted: 1, acked: 1, retried: 0 });
+    assert.equal(timeoutValue, timeout);
+    t.mock.restoreAll();
+  }
+});
+
+test('Worker rejects invalid transport configuration without sending or deleting queued mail', async t => {
+  for (const settings of [
+    { MAILBRIDGE_BEHAVIOR_PROFILE: 'typo' },
+    { MAILBRIDGE_HTTP_ALLOW_REDIRECTS: 'sometimes' },
+    ...['-1', 'abc', '1.5', 'Infinity', '4294967296'].map(value => ({ MAILBRIDGE_HTTP_TIMEOUT_MS: value }))
+  ]) {
+    const { state, env, msg } = queueFixture();
+    Object.assign(env, settings);
+    let fetches = 0;
+    t.mock.method(globalThis, 'fetch', async () => { fetches++; return new Response('OK'); });
+    await worker.queue({ messages: [msg] }, env);
+    assert.equal(fetches, 0);
+    assert.deepEqual(state, { deleted: 0, acked: 0, retried: 1 });
+    t.mock.restoreAll();
+  }
+});
+
+test('Worker send endpoint accepts both legacy and recipient-preserving payloads', async () => {
+  for (const payload of [
+    { from: 'sender@example.com', to: 'dest@example.com', text: 'Body' },
+    { from: 'sender@example.com', to: ['dest@example.com'], cc: ['copy@example.com'], bcc: ['hidden@example.com'], replyTo: 'replies@example.com', text: 'Body' },
+    { from: 'sender@example.com', bcc: ['hidden@example.com'], text: 'Body' }
+  ]) {
+    let sent;
+    const response = await worker.fetch(new Request('https://worker.example/api/send/email', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Webhook-Secret': 'synthetic' }, body: JSON.stringify(payload)
+    }), { WEBHOOK_SECRET: 'synthetic', EMAIL: { async send(value) { sent = value; return { messageId: 'synthetic' }; } } });
+    assert.equal(response.status, 200);
+    assert.deepEqual(sent, payload);
+  }
 });

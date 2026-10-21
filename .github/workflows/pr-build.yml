@@ -39,6 +39,14 @@ jobs:
         if: runner.os == 'Linux'
         run: docker build --tag mailbridge-pr:${{ github.sha }} .
 
+      - name: Verify plugin container isolation
+        if: runner.os == 'Linux'
+        env:
+          MAILBRIDGE_TEST_DOCKER: "true"
+        run: |
+          node -e "require('node:child_process').execFileSync('docker', ['pull', require('./lib/plugin-process').DEFAULT_DOCKER_IMAGE], { stdio: 'inherit' })"
+          node --test test/plugin-process.test.js
+
       - name: Validate Worker bundle
         if: runner.os == 'Linux'
         run: npx --no-install wrangler deploy --dry-run --config wrangler.example.toml

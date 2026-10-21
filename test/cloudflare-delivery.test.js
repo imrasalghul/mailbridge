@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const http = require('node:http');
+const { once } = require('node:events');
 const { createCloudflareDelivery } = require('../lib/cloudflare-delivery');
 
 const raw = [
@@ -52,4 +54,34 @@ test('Cloudflare transport keeps infrastructure and authentication failures retr
       return true;
     });
   }
+});
+
+test('Cloudflare redirect handling preserves legacy delivery and supports strict opt-in', async t => {
+  const names = ['MAILBRIDGE_BEHAVIOR_PROFILE', 'MAILBRIDGE_HTTP_ALLOW_REDIRECTS'];
+  const previous = names.map(name => process.env[name]);
+  names.forEach(name => { delete process.env[name]; });
+  t.after(() => names.forEach((name, index) => {
+    if (previous[index] === undefined) delete process.env[name];
+    else process.env[name] = previous[index];
+  }));
+  let deliveries = 0;
+  const server = http.createServer((request, response) => {
+    request.resume();
+    if (request.url === '/redirect') {
+      response.writeHead(307, { Location: '/api/send/email' }).end();
+    } else {
+      deliveries++;
+      response.writeHead(200, { 'Content-Type': 'application/json' }).end('{"messageId":"synthetic"}');
+    }
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const options = { workerUrl: `http://127.0.0.1:${server.address().port}/redirect`, webhookSecret: 'synthetic' };
+  assert.equal((await createCloudflareDelivery(options)('sender@example.com', ['visible@example.com'], raw)).status, 200);
+  assert.equal(deliveries, 1);
+  await assert.rejects(createCloudflareDelivery({ ...options, allowRedirects: false })('sender@example.com', ['visible@example.com'], raw), error => error.statusCode === 307 && error.permanent === false);
+  assert.equal(deliveries, 1);
+  assert.equal((await createCloudflareDelivery({ ...options, allowRedirects: true })('sender@example.com', ['visible@example.com'], raw)).status, 200);
+  assert.equal(deliveries, 2);
 });

@@ -7,11 +7,19 @@
 - Remediate all 16 reported CodeQL alerts: safe HTTP errors, log encoding, cryptographic request identifiers, atomic file access, workflow permissions, and immutable action pins.
 - Preserve setup secrets, installed plugin settings, custom runtime paths, and the active encryption key. Preserve Windows paths when writing environment files.
 - Keep SMTP temporary failures retryable, accept null reverse-path senders, and distinguish permanent SMTP rejection from infrastructure failures.
-- Suppress repeat inbound deliveries with persistent receipts, including during rolling Worker upgrades and R2 cleanup retries. Keep undecryptable ciphertext available for recovery.
+- Add opt-in persistent delivery receipts for existing installations, enabled by default for fresh setup, including protection during rolling Worker upgrades and R2 cleanup retries. Keep undecryptable ciphertext available for recovery.
 - Add a Cloudflare dead-letter queue and an authenticated endpoint for replaying encrypted R2 references.
 - Keep blind recipients out of visible headers and preserve reply/threading headers.
 - Prevent audit failures from causing duplicate delivery, serialize audit-chain writes, and handle early plugin exits without crashing the host.
 - Exclude runtime mail, keys, databases, and live configuration from Docker build contexts.
+
+### Plugins and compatibility
+
+- Preserve existing environments and plugin interfaces through the default legacy profile; fresh setup selects modern behavior. Keep compatibility support for at least the next three releases without reverting security fixes or dependency pins.
+- Add transactional exact-version plugin installs, upgrades, rollback, enable/disable, removal, and health commands, with full dependency locks and installed-file verification.
+- Add strict response/configuration validation, namespaced secrets, and fail-closed discovery for unavailable enabled plugins in modern mode.
+- Fix split UTF-8 output, supervise execution and shutdown, and add configurable concurrency, memory limits, and optional Docker isolation.
+- Preserve existing setup quoting, custom paths, linked configuration, and Worker settings during upgrades. Document rollout flags and administration commands in the README.
 
 ### Dependencies and validation
 
@@ -21,4 +29,6 @@
 
 ### Upgrade notes
 
-Deploy the backend before the Worker. Create the configured dead-letter queue before deploying the new Worker configuration. Preserve `delivery-receipts.db` with the mail queue and key backups. See [delivery recovery](README.md#delivery-retries-and-recovery).
+Existing environment files without `MAILBRIDGE_BEHAVIOR_PROFILE` keep legacy behavior. New setup and the example environment select `modern`; individual features can be enabled through environment settings. Node.js remains `>=22.23.3`. See [upgrade compatibility](README.md#upgrades-and-compatibility).
+
+Deploy the backend before the Worker. When enabling delivery receipts, preserve `delivery-receipts.db` with the mail queue and key backups. Create a dead-letter queue before deploying a Worker configuration that references it; existing setup retains its queue configuration until explicitly opted in. See [delivery recovery](README.md#delivery-retries-and-recovery).

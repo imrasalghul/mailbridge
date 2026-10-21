@@ -97,6 +97,7 @@ export default {
         });
 
         const bridgeUrl = buildBridgeEndpointUrl(env.NODE_APP_URL);
+        const transportOptions = buildBridgeTransportOptions(env);
         const response = await fetch(bridgeUrl, {
           method: "POST",
           headers: {
@@ -105,8 +106,7 @@ export default {
             "X-Mailbridge-Delivery-Id": objectKey,
           },
           body: JSON.stringify(requestBody),
-          redirect: "error",
-          signal: AbortSignal.timeout(120000),
+          ...transportOptions,
         });
 
         if (response.ok) {
@@ -247,6 +247,27 @@ function buildBridgeEndpointUrl(value) {
   }
 
   return url.toString();
+}
+
+function buildBridgeTransportOptions(env) {
+  const profile = String(env.MAILBRIDGE_BEHAVIOR_PROFILE || "legacy").trim().toLowerCase();
+  if (!["legacy", "modern"].includes(profile)) throw new Error("Invalid MAILBRIDGE_BEHAVIOR_PROFILE");
+  let allowRedirects = profile === "legacy";
+  const redirectSetting = String(env.MAILBRIDGE_HTTP_ALLOW_REDIRECTS ?? "").trim().toLowerCase();
+  if (redirectSetting) {
+    if (["true", "1", "yes", "on"].includes(redirectSetting)) allowRedirects = true;
+    else if (["false", "0", "no", "off"].includes(redirectSetting)) allowRedirects = false;
+    else throw new Error("Invalid MAILBRIDGE_HTTP_ALLOW_REDIRECTS");
+  }
+  const timeoutSetting = String(env.MAILBRIDGE_HTTP_TIMEOUT_MS ?? "").trim();
+  const timeoutMs = timeoutSetting ? Number(timeoutSetting) : profile === "modern" ? 120000 : 0;
+  if ((timeoutSetting && !/^\d+$/.test(timeoutSetting)) || !Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 4294967295) {
+    throw new Error("Invalid MAILBRIDGE_HTTP_TIMEOUT_MS");
+  }
+  return {
+    redirect: allowRedirects ? "follow" : "error",
+    ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+  };
 }
 
 async function buildBridgeRequestBody({ object, objectKey, payload }) {

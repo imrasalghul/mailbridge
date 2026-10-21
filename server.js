@@ -15,7 +15,11 @@ const { createCloudflareDelivery } = require('./lib/cloudflare-delivery');
 const { extractDomainFromAddress } = require('./lib/email-metadata');
 const { createInboundMessageDecryptor } = require('./lib/inbound-message-crypto');
 const { createLocalMailTransport } = require('./lib/local-mail-transport');
-const { createPluginManager } = require('./lib/plugin-manager');
+const { createPluginManager, createPluginExecutor } = require('./lib/plugin-manager');
+const { getCompatibility, getPluginExecutionOptions } = require('./lib/compatibility');
+const { registerPluginShutdown } = require('./lib/plugin-shutdown');
+const { pluginEnvironment: resolvePluginEnvironment, loadPluginConfig } = require('./lib/plugin-environment');
+const { formatLog } = require('./lib/log-format');
 const { createQueueCrypto } = require('./lib/queue-crypto');
 const { createQueueManager } = require('./lib/queue-manager');
 const { createQueueStore } = require('./lib/queue-store');
@@ -38,6 +42,8 @@ const port = Number.parseInt(process.env.PORT || '3090', 10);
 const smtpRelayPort = Number.parseInt(process.env.SMTP_RELAY_PORT || '2525', 10);
 const smtpRelayMaxMessageBytes = Number.parseInt(process.env.SMTP_RELAY_MAX_MESSAGE_BYTES || String(50 * 1024 * 1024), 10);
 const maxQueueAttempts = Number.parseInt(process.env.QUEUE_MAX_ATTEMPTS || '20', 10);
+const compatibility = getCompatibility();
+const logLine = message => formatLog(message, compatibility.logFormat);
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const dbPath = path.join(dataDir, 'mailbridge.db');
 const secretsDbPath = path.resolve(process.env.SECRETS_DB_PATH || path.join(__dirname, 'secrets', 'secrets.db'));
@@ -56,34 +62,41 @@ const smtpRelayInjectHeaders = parseBoolean(process.env.SMTP_RELAY_INJECT_HEADER
 const spamcFailOpen = parseBoolean(process.env.SPAMC_FAIL_OPEN, false);
 const configuredUpstreamProvider = String(process.env.RELAY_UPSTREAM_PROVIDER || 'cloudflare').trim().toLowerCase();
 const relayFromFallback = process.env.RELAY_FROM_FALLBACK || process.env.SENDGRID_FROM_FALLBACK || 'postmaster@localhost';
+const pluginExecutor = createPluginExecutor(getPluginExecutionOptions());
+registerPluginShutdown(pluginExecutor);
 const pluginManager = createPluginManager({
   pluginDirectory: process.env.MAILBRIDGE_PLUGIN_DIR || path.join(dataDir, 'plugins'),
   lockfilePath: process.env.MAILBRIDGE_PLUGIN_LOCKFILE || path.join(dataDir, 'plugins.lock.json'),
+  strict: compatibility.pluginStrict,
+  executor: pluginExecutor,
   log: (...args) => logVerbose(...args)
 });
-let pluginConfigFile = {};
-try {
-  const configPath = process.env.MAILBRIDGE_PLUGIN_CONFIG_FILE || path.join(dataDir, 'plugins.config.json');
-  if (configPath && fs.existsSync(configPath)) pluginConfigFile = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-} catch (error) {
-  console.warn(JSON.stringify(`[Plugin] Ignoring invalid plugin config file: ${error.message}`));
-}
+const pluginConfigPath = process.env.MAILBRIDGE_PLUGIN_CONFIG_FILE || path.join(dataDir, 'plugins.config.json');
+const legacyPluginConfig = compatibility.pluginStrict ? {} : loadPluginConfig(pluginConfigPath, { log: message => console.warn(logLine(message)) });
 
 function pluginEnvironment(manifest) {
-  const prefix = `MAILBRIDGE_PLUGIN_${manifest.id.toUpperCase().replace(/-/g, '_')}_`;
-  const fieldNames = (fields) => Array.isArray(fields) ? fields : Object.keys(fields || {});
-  const config = { ...(pluginConfigFile[manifest.id] || {}) };
-  const secrets = {};
-  for (const name of fieldNames(manifest.config)) if (process.env[`${prefix}${name}`] !== undefined) config[name] = process.env[`${prefix}${name}`];
-  for (const name of fieldNames(manifest.secrets)) {
-    if (process.env[`${prefix}${name}`] !== undefined) secrets[name] = process.env[`${prefix}${name}`];
-    else if (process.env[name] !== undefined) secrets[name] = process.env[name];
+  return resolvePluginEnvironment(manifest, {
+    config: compatibility.pluginStrict ? loadPluginConfig(pluginConfigPath, { strict: true }) : legacyPluginConfig,
+    strict: compatibility.pluginStrict
+  });
+}
+
+function pluginReadiness() {
+  try {
+    const plugins = pluginManager.discover();
+    for (const { manifest } of plugins) pluginEnvironment(manifest);
+    if (smtpRelayEnabled && configuredUpstreamProvider !== 'cloudflare') {
+      const { manifest } = pluginManager.find(configuredUpstreamProvider);
+      if (manifest.type !== 'provider') return false;
+    }
+    return true;
+  } catch {
+    return false;
   }
-  return { config, secrets };
 }
 
 async function invokeCapability(type, capability, operation, payload) {
-  const plugins = pluginManager.discover()
+  const plugins = pluginManager.discover({ type, capability })
     .filter(({ manifest }) => manifest.type === type && manifest.capabilities.includes(capability))
     .sort((a, b) => a.manifest.priority - b.manifest.priority || a.manifest.id.localeCompare(b.manifest.id));
   const results = [];
@@ -94,7 +107,7 @@ async function invokeCapability(type, capability, operation, payload) {
       results.push({ plugin: manifest, result: response.result || {} });
     } catch (error) {
       if (manifest.failurePolicy === 'fail-closed') throw error;
-      console.warn(JSON.stringify(`[${payload.requestId}] Plugin ${manifest.id} failed open: ${error.message}`));
+      console.warn(logLine(`[${payload.requestId}] Plugin ${manifest.id} failed open: ${error.message}`));
     }
   }
   return results;
@@ -102,7 +115,7 @@ async function invokeCapability(type, capability, operation, payload) {
 
 async function applyMiddlewarePlugins({ requestId, from, to, rawEmail, sourceIp }) {
   let current = { from, to, rawEmail };
-  const middleware = pluginManager.discover()
+  const middleware = pluginManager.discover({ type: 'middleware' })
     .filter(({ manifest }) => manifest.type === 'middleware')
     .sort((a, b) => a.manifest.priority - b.manifest.priority || a.manifest.id.localeCompare(b.manifest.id));
   for (const { manifest } of middleware) {
@@ -119,7 +132,7 @@ async function applyMiddlewarePlugins({ requestId, from, to, rawEmail, sourceIp 
       if (typeof result.to === 'string') current.to = result.to;
     } catch (error) {
       if (manifest.failurePolicy === 'fail-closed') throw error;
-      console.warn(JSON.stringify(`[${requestId}] Middleware ${manifest.id} failed open: ${error.message}`));
+      console.warn(logLine(`[${requestId}] Middleware ${manifest.id} failed open: ${error.message}`));
     }
   }
   return { rejected: false, ...current };
@@ -135,7 +148,7 @@ function logVerbose(scope, message, details = {}) {
       return `${key}=${value}`;
     })
     .join(' ');
-  console.log(JSON.stringify(`${scope} ${message}${formattedDetails ? ` ${formattedDetails}` : ''}`));
+  console.log(logLine(`${scope} ${message}${formattedDetails ? ` ${formattedDetails}` : ''}`));
 }
 
 function logSmtpRelay(scope, message, details = {}) {
@@ -149,7 +162,21 @@ async function start() {
 
   const app = express();
   app.use(express.json({ limit: '50mb' }));
-  app.get('/health', (req, res) => res.status(200).send('OK'));
+  app.get('/health', (req, res) => {
+    const ready = !compatibility.pluginStrict || pluginReadiness();
+    res.type('text/plain').status(ready ? 200 : 503).send(ready ? 'OK' : 'Required plugin unavailable');
+  });
+  app.get('/api/plugins/status', (req, res) => {
+    if (!process.env.WEBHOOK_SECRET || req.headers['x-webhook-secret'] !== process.env.WEBHOOK_SECRET) return res.status(403).json({ error: 'Forbidden' });
+    const plugins = pluginManager.status().map(entry => {
+      let ready = !entry.error;
+      if (ready && entry.enabled) {
+        try { pluginEnvironment(entry.manifest); } catch { ready = false; }
+      }
+      return { id: entry.id, version: entry.version, type: entry.type, enabled: entry.enabled, state: !entry.enabled ? 'disabled' : ready ? 'ready' : 'unavailable' };
+    });
+    return res.json({ profile: compatibility.profile, ready: pluginReadiness(), plugins, execution: pluginExecutor.status() });
+  });
 
   const queueCrypto = createQueueCrypto();
   const auditStore = createAuditLogStore({
@@ -158,8 +185,8 @@ async function start() {
     log: logVerbose
   });
   await auditStore.init();
-  const receiptStore = createDeliveryReceiptStore({ dbPath: path.join(dataDir, 'delivery-receipts.db') });
-  await receiptStore.init();
+  const receiptStore = compatibility.receipts ? createDeliveryReceiptStore({ dbPath: path.join(dataDir, 'delivery-receipts.db') }) : null;
+  if (receiptStore) await receiptStore.init();
   const secretsDb = new sqlite3.Database(secretsDbPath);
 
   const queueStore = createQueueStore({
@@ -181,6 +208,7 @@ async function start() {
     injectHeaders: smtpRelayInjectHeaders,
     relayHostname: mailbridgeHostname,
     fromFallback: relayFromFallback,
+    allowRedirects: compatibility.allowRedirects,
     log: logVerbose
   });
   const sendViaUpstream = async ({ provider = configuredUpstreamProvider, from, to, rawInput }) => {
@@ -280,9 +308,9 @@ async function start() {
       } catch (error) {
         const statusCode = error.statusCode || 500;
         if (statusCode >= 500) {
-          console.error(JSON.stringify(`[${requestId}] Encrypted payload could not be processed`));
+          console.error(logLine(`[${requestId}] Encrypted payload could not be processed`));
         } else {
-          console.warn(JSON.stringify(`[${requestId}] Invalid encrypted payload rejected`));
+          console.warn(logLine(`[${requestId}] Invalid encrypted payload rejected`));
         }
         return { statusCode, body: statusCode >= 500 ? 'Encrypted mail processing unavailable' : 'Invalid encrypted payload' };
       }
@@ -318,7 +346,7 @@ async function start() {
       const senderDomain = reputationCheck.senderDomain || extractDomainFromAddress(from);
 
       if (reputationCheck.blocked) {
-        console.warn(JSON.stringify(`[${requestId}] Rejected sender by reputation plugin. domain=${senderDomain || 'n/a'}`));
+        console.warn(logLine(`[${requestId}] Rejected sender by reputation plugin. domain=${senderDomain || 'n/a'}`));
         await auditStore.logEvent({
           requestId,
           eventType: 'reputation_plugin_blocked',
@@ -345,7 +373,7 @@ async function start() {
         spamAssassinResult = await spamAssassinClient.checkMessage(raw, requestId);
         spamScore = spamAssassinResult.score;
       } catch (spamError) {
-        console.warn(JSON.stringify(`[${requestId}] ${spamError.message}. Falling back to classification plugins.`));
+        console.warn(logLine(`[${requestId}] ${spamError.message}. Falling back to classification plugins.`));
         spamSource = 'plugin-fallback';
         const classificationFallback = await classifyWithPlugins(raw, requestId);
         await logClassificationEvent({
@@ -364,7 +392,7 @@ async function start() {
         } else if (classificationFallback?.spam === '0') {
           spamReason = 'plugin_fallback_not_spam';
         } else if (!spamcFailOpen) {
-          console.error(JSON.stringify(`[${requestId}] SpamAssassin and classification plugins unavailable. Rejecting inbound mail (SPAMC_FAIL_OPEN=false).`));
+          console.error(logLine(`[${requestId}] SpamAssassin and classification plugins unavailable. Rejecting inbound mail (SPAMC_FAIL_OPEN=false).`));
           await auditStore.logEvent({
             requestId,
             eventType: 'delivery_failed',
@@ -379,7 +407,7 @@ async function start() {
           });
           return { statusCode: 503, body: 'Spam filter unavailable' };
         } else {
-          console.warn(JSON.stringify(`[${requestId}] SpamAssassin and classification plugins unavailable. Continuing with fail-open behavior (SPAMC_FAIL_OPEN=true).`));
+          console.warn(logLine(`[${requestId}] SpamAssassin and classification plugins unavailable. Continuing with fail-open behavior (SPAMC_FAIL_OPEN=true).`));
           spamReason = 'fail_open';
         }
         spamAssassinResult = { score: 0 };
@@ -494,18 +522,20 @@ async function start() {
         injectedHeaderLines: headers.split('\r\n').filter(Boolean).length
       });
 
-      return await deliverInboundMessage({
+      const delivered = await deliverInboundMessage({
         transport: localMailTransport, queueManager, auditStore,
         from: transformedFrom, to: transformedTo, raw: transformedRaw,
         context: { requestId, sourceIp, senderDomain }
       });
+      if (delivered.statusCode === 200) console.log(logLine(`[${requestId}] Direct delivery successful.`));
+      return delivered;
     } catch (error) {
-      console.error(JSON.stringify(`[${requestId}] Error: ${error.message}`));
+      console.error(logLine(`[${requestId}] Error: ${error.message}`));
       return { statusCode: 503, body: 'Mail processing temporarily unavailable' };
     }
   };
   app.post('/api/webhook/email', createWebhookHandler({
-    webhookSecret: process.env.WEBHOOK_SECRET, receiptStore, processWebhook
+    webhookSecret: process.env.WEBHOOK_SECRET, receiptStore, processWebhook, receiptsEnabled: compatibility.receipts
   }));
 
   app.use((error, req, res, next) => {
@@ -533,7 +563,7 @@ async function start() {
     });
 
     smtpRelayServer.listen(smtpRelayPort, '0.0.0.0', () => {
-      console.log(JSON.stringify(`Mail Bridge SMTP relay running on port ${smtpRelayPort}`));
+      console.log(logLine(`Mail Bridge SMTP relay running on port ${smtpRelayPort}`));
     });
   } else {
     console.log('Mail Bridge SMTP relay disabled. Set SMTP_RELAY_ENABLED=true to enable outbound relay.');
@@ -541,10 +571,10 @@ async function start() {
 }
 
 start().catch((error) => {
-  console.error(JSON.stringify(`[Startup] ${error?.message || error}`));
+  console.error(logLine(`[Startup] ${error?.message || error}`));
   process.exit(1);
 });
 
 process.on('unhandledRejection', (error) => {
-  console.error(JSON.stringify(`[Process] Unhandled rejection: ${error?.message || error}`));
+  console.error(logLine(`[Process] Unhandled rejection: ${error?.message || error}`));
 });
