@@ -29,7 +29,10 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-24.04
-    container: debian:trixie-slim
+    container: debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+    defaults:
+      run:
+        shell: bash
     env:
       GNUPGHOME: /tmp/mailbridge-gnupg
       EXTERNAL_PACKAGE_URL: ${{ github.event.client_payload.package_url || inputs.package_url || '' }}
@@ -40,7 +43,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends awscli ca-certificates curl dpkg-dev git g++ gnupg make python3 reprepro xz-utils
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build or download package
         run: |
@@ -132,7 +135,7 @@ jobs:
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           aws s3 sync apt-repo/ "s3://${R2_BUCKET_NAME}/" --endpoint-url "$endpoint"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: published-debian-packages
           path: dist/debian/*.deb

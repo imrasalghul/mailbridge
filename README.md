@@ -43,7 +43,7 @@ trusted CIDR-restricted SMTP client
 
 Requirements:
 
-- Node.js 22 or newer
+- Node.js 22.23.3 or newer (packaged runtime: 22.23.3)
 - Docker with Docker Compose
 - Cloudflare Email Routing, Workers, R2, and Queues
 - A private SMTP server
@@ -55,9 +55,9 @@ npm install
 npm run setup
 ```
 
-The assistant creates `.env`, `wrangler.toml`, runtime directories, independent webhook secrets, the local queue master key, and the RSA keypair used for encrypted R2 handoff. It asks before overwriting existing configuration.
+The assistant creates `.env`, `wrangler.toml`, runtime directories, independent webhook secrets, the local queue master key, and the RSA keypair used for encrypted R2 handoff. It asks before overwriting existing configuration. Reruns retain existing secrets, keypairs, provider selection, and plugin settings. Restore a missing queue master key from backup before running setup when queued mail exists; generating a replacement cannot decrypt that mail. Secret values are not printed in setup's deployment instructions.
 
-Optional scanners and outbound providers are installed as exact-version plugins. For example, use `mailbridge-plugin-spamhaus@1.0.0`; unversioned packages, `latest`, and version ranges are rejected. Plugins run in supervised child processes and receive only their declared namespaced settings and secrets.
+Cloudflare Email Service is built in. Other providers and optional scanners require separately published plugins. Supply an existing, trusted package with an exact version; setup does not assume named example packages are available on npm. Unversioned packages, `latest`, and version ranges are rejected. Plugins run in supervised child processes and receive only their declared namespaced settings and secrets.
 
 Mailbridge discovers plugins from `MAILBRIDGE_PLUGIN_DIR` using `mailbridge-plugin.json`. A plugin declares one of three types:
 
@@ -138,6 +138,30 @@ Never commit `.env`, live `wrangler.toml`, private keys, provider credentials, t
 
 Read the complete [Security Model](https://github.com/imrasalghul/mailbridge/wiki/Security-Model) and repository [Security Policy](SECURITY.md).
 
+## Delivery retries and recovery
+
+The Worker supplies a stable delivery identity for each R2 object. Mailbridge stores completed outcomes in `DATA_DIR/delivery-receipts.db`; repeated or concurrent handoffs reuse those outcomes. This prevents another SMTP delivery when the original HTTP response or R2 cleanup fails. Back up this database along with the queue and its keys, and retain it while an R2 object or queue reference might still be replayed. Receipts contain identifiers, hashes, and generic outcomes, not raw mail. SMTP itself cannot guarantee exactly-once delivery if the process crashes after the remote server accepts mail but before the receipt is saved, or if the SMTP acknowledgement is lost.
+
+SMTP 4xx failures enter the encrypted local retry queue; SMTP 5xx rejections return HTTP 422. The Worker deletes rejected mail only for explicit HTTP 400, 406, 413, or 422 responses. Authentication, configuration, timeout, throttling, and server failures retry without deleting R2 ciphertext.
+
+Create `mailbridge-inbound-dead-letter` before deploying the updated Worker configuration. Setup creates it automatically when deployment is selected. Existing installations should add `dead_letter_queue = "mailbridge-inbound-dead-letter"` to their queue consumer, using the actual queue name if customized. Monitor this queue: [Cloudflare moves exhausted messages to the dead-letter queue](https://developers.cloudflare.com/queues/configuration/dead-letter-queues/), whose retention is finite. The encrypted R2 object remains available for recovery even after its queue reference expires, unless a bucket lifecycle rule removes it.
+
+After correcting the underlying delivery failure, take the `objectKey` from a dead-letter message or the R2 listing and call the authenticated recovery endpoint. This example uses the inbound `WEBHOOK_SECRET` from the local environment file and prints only the response status:
+
+```bash
+node --env-file=.env --input-type=module <<'NODE'
+const response = await fetch('https://mailbridge-worker.example.workers.dev/api/replay/email', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'X-Webhook-Secret': process.env.WEBHOOK_SECRET },
+  body: JSON.stringify({ objectKey: 'inbound/2026-10-21/replace-with-object-uuid.bin' })
+});
+console.log(response.status);
+if (response.status !== 202) process.exitCode = 1;
+NODE
+```
+
+Replace the Worker hostname and object key. HTTP 202 means the encrypted reference was queued again; acknowledge the old dead-letter entry after this succeeds. The outbound-only secret cannot authorize recovery. Deploy the backend receipt support before the new Worker, then verify with synthetic staging mail.
+
 ## Documentation
 
 - [Wiki Home](https://github.com/imrasalghul/mailbridge/wiki)
@@ -174,7 +198,7 @@ This repository contains backend and Cloudflare edge code only; there is no brow
 npm install
 npm test
 npm audit --omit=dev
-npx wrangler deploy --dry-run --config wrangler.example.toml
+npx --no-install wrangler deploy --dry-run --config wrangler.example.toml
 ```
 
 For container changes:

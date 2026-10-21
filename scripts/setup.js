@@ -6,11 +6,31 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const readline = require('node:readline/promises');
+const { parse: parseEnv } = require('dotenv');
 const { createPluginManager, assertExactPackageSpecifier } = require('../lib/plugin-manager');
+const { readOptionalFile, writeFileAtomic } = require('../lib/atomic-files');
+
+const WRANGLER_PACKAGE = 'wrangler@4.151.3';
 
 function envValue(value) {
   const text = String(value ?? '');
-  return /^[A-Za-z0-9_./:@,+\-[\]]*$/.test(text) ? text : JSON.stringify(text);
+  if (/^[A-Za-z0-9_./:@,+\-[\]]*$/.test(text)) return text;
+  // Use the common subset of dotenv, systemd EnvironmentFile, and Compose:
+  // double quotes without escapes/interpolation, or literal single quotes.
+  // Backtick delimiters and escaped newlines are not portable.
+  const candidates = [];
+  if (!/[\u0000-\u0008\u000B-\u001F\u007F\uFEFF]/.test(text) && text.isWellFormed()) {
+    if (!/["\\$\n`]/.test(text)) candidates.push(`"${text}"`);
+    if (!text.includes("'") && !text.endsWith('\\')) candidates.push(`'${text}'`);
+  }
+  for (const candidate of candidates) {
+    const serialized = `VALUE=${candidate}\nBOUNDARY=unchanged\n`;
+    if ([false, true].every(fast => {
+      const parsed = parseEnv(serialized, { fast });
+      return Object.keys(parsed).length === 2 && parsed.VALUE === text && parsed.BOUNDARY === 'unchanged';
+    })) return candidate;
+  }
+  throw new Error('Environment value cannot be represented safely across dotenv, systemd, and Docker Compose');
 }
 
 function tomlValue(value) {
@@ -26,6 +46,71 @@ function generateKeyPair() {
   return { privateKey, publicKey };
 }
 
+function configuredHostPath(configuredPath, runtimeDefault, hostDefault, cwd) {
+  return configuredPath && path.normalize(configuredPath) !== path.normalize(runtimeDefault)
+    ? path.resolve(cwd, configuredPath)
+    : hostDefault;
+}
+
+function publicKeyFromPrivateFile(privatePath) {
+  try {
+    const contents = readOptionalFile(privatePath);
+    if (!contents) throw new Error('Missing private key');
+    const privateKey = crypto.createPrivateKey(contents);
+    if (privateKey.asymmetricKeyType !== 'rsa') throw new Error('Expected an RSA private key');
+    return crypto.createPublicKey(privateKey).export({ type: 'spki', format: 'pem' });
+  } catch {
+    throw new Error('Configured Mailbridge private key is missing, unreadable, or invalid; restore the pair before running setup');
+  }
+}
+
+function loadKeyPair(privatePath, publicPath) {
+  const publicKey = publicKeyFromPrivateFile(privatePath);
+  const existingPublicKey = readOptionalFile(publicPath);
+  if (!existingPublicKey) throw new Error('Only one Mailbridge key file exists; restore the pair before running setup');
+  if (crypto.createPublicKey(existingPublicKey).export({ type: 'spki', format: 'pem' }) !== publicKey) {
+    throw new Error('Mailbridge key files do not match; restore the pair before running setup');
+  }
+  return { publicKey };
+}
+
+function createOrLoadKeyPair(keyDirectory) {
+  fs.mkdirSync(keyDirectory, { recursive: true, mode: 0o700 });
+  const privatePath = path.join(keyDirectory, 'mailbridge-r2-private.pem');
+  const publicPath = path.join(keyDirectory, 'mailbridge-r2-public.pem');
+  let privateDescriptor;
+  try {
+    privateDescriptor = fs.openSync(privatePath, 'wx', 0o600);
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    return loadKeyPair(privatePath, publicPath);
+  }
+  let publicDescriptor;
+  let complete = false;
+  try {
+    try {
+      publicDescriptor = fs.openSync(publicPath, 'wx', 0o644);
+    } catch (error) {
+      if (error.code === 'EEXIST') throw new Error('Only one Mailbridge key file exists; restore the pair before running setup');
+      throw error;
+    }
+    const keys = generateKeyPair();
+    fs.writeFileSync(privateDescriptor, keys.privateKey);
+    fs.fsyncSync(privateDescriptor);
+    fs.writeFileSync(publicDescriptor, keys.publicKey);
+    fs.fsyncSync(publicDescriptor);
+    complete = true;
+    return { publicKey: keys.publicKey };
+  } finally {
+    fs.closeSync(privateDescriptor);
+    if (publicDescriptor !== undefined) fs.closeSync(publicDescriptor);
+    if (!complete) {
+      fs.unlinkSync(privatePath);
+      if (publicDescriptor !== undefined) fs.unlinkSync(publicPath);
+    }
+  }
+}
+
 function runCommand(command, args, { cwd, input, output }) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -36,6 +121,7 @@ function runCommand(command, args, { cwd, input, output }) {
       output.write(chunk);
     });
     child.once('error', reject);
+    child.stdin.on('error', reject);
     child.once('close', (code) => {
       if (code === 0) resolve();
       else reject(new Error(`${command} ${args.join(' ')} failed with exit code ${code}${stderr.trim() ? `: ${stderr.trim()}` : ''}`));
@@ -45,7 +131,7 @@ function runCommand(command, args, { cwd, input, output }) {
 }
 
 async function deployWorker({ cwd, npxCommand, artifacts, output }) {
-  const configArgs = ['--yes', 'wrangler', '--config', path.join(cwd, 'wrangler.toml')];
+  const configArgs = ['--yes', WRANGLER_PACKAGE, '--config', path.join(cwd, 'wrangler.toml')];
   const ensureResource = async (args, label) => {
     try {
       await runCommand(npxCommand, [...configArgs, ...args], { cwd, output });
@@ -61,6 +147,7 @@ async function deployWorker({ cwd, npxCommand, artifacts, output }) {
   output.write('\nCreating or verifying Cloudflare resources...\n');
   await ensureResource(['r2', 'bucket', 'create', artifacts.r2BucketName], `R2 bucket ${artifacts.r2BucketName}`);
   await ensureResource(['queues', 'create', artifacts.queueName], `Queue ${artifacts.queueName}`);
+  await ensureResource(['queues', 'create', artifacts.deadLetterQueueName], `Dead-letter queue ${artifacts.deadLetterQueueName}`);
   output.write('Deploying the Worker and uploading generated Worker secrets...\n');
   await runCommand(npxCommand, [...configArgs, 'secret', 'put', 'WEBHOOK_SECRET'], {
     cwd,
@@ -81,6 +168,7 @@ async function deployWorker({ cwd, npxCommand, artifacts, output }) {
 }
 
 function generateArtifacts(config, generated = {}) {
+  const deadLetterQueueName = `${config.queueName}-dead-letter`;
   const queueMasterKey = generated.queueMasterKey || crypto.randomBytes(32).toString('base64');
   const webhookSecret = generated.webhookSecret || crypto.randomBytes(48).toString('base64');
   const cloudflareSendSecret = generated.cloudflareSendSecret || crypto.randomBytes(48).toString('base64');
@@ -137,6 +225,18 @@ function generateArtifacts(config, generated = {}) {
     SPAM_SUBJECT_TAG: '[SPAM]',
     ...(config.pluginSecretEnvironment || {})
   };
+  const configuredKeys = new Set([
+    'MAILBRIDGE_HOSTNAME', 'QUEUE_MASTER_KEY', 'WEBHOOK_SECRET', 'CLOUDFLARE_SEND_WEBHOOK_SECRET',
+    'CLOUDFLARED_ENABLED', 'CLOUDFLARED_TUNNEL_TOKEN', 'LOCAL_MAIL_HOST', 'LOCAL_MAIL_PORT',
+    'LOCAL_MAIL_REQUIRE_TLS', 'LOCAL_MAIL_TLS_SERVERNAME', 'LOCAL_MAIL_TLS_CA_FILE',
+    'RELAY_UPSTREAM_PROVIDER', 'RELAY_FROM_FALLBACK', 'CLOUDFLARE_SEND_WORKER_URL',
+    'SMTP_RELAY_ENABLED', 'SMTP_RELAY_REQUIRE_TLS', 'SMTP_RELAY_ALLOW_INSECURE',
+    'SMTP_RELAY_ALLOWED_CIDRS', 'SMTP_RELAY_TLS_CERT_FILE', 'SMTP_RELAY_TLS_KEY_FILE',
+    'SMTP_RELAY_TLS_CA_FILE', 'SPAMASSASSIN_MODE', ...Object.keys(config.pluginSecretEnvironment || {})
+  ]);
+  for (const [name, value] of Object.entries(config.existingEnvironment || {})) {
+    if (!configuredKeys.has(name)) env[name] = value;
+  }
 
   const sections = [
     ['Node App Configuration', ['PORT', 'SMTP_RELAY_PORT', 'SMTP_RELAY_SOCKET_TIMEOUT_MS', 'SMTP_RELAY_MAX_MESSAGE_BYTES', 'MAILBRIDGE_VERBOSE_LOGGING', 'MAILBRIDGE_HOSTNAME', 'QUEUE_MAX_ATTEMPTS', 'DATA_DIR', 'SECRETS_DB_PATH', 'MAILBRIDGE_PLUGIN_DIR', 'MAILBRIDGE_PLUGIN_LOCKFILE', 'MAILBRIDGE_PLUGIN_CONFIG_FILE', 'QUEUE_MASTER_KEY', 'MAILBRIDGE_PRIVATE_KEY_PATH', 'AUDIT_LOG_RETENTION_DAYS']],
@@ -148,10 +248,12 @@ function generateArtifacts(config, generated = {}) {
     ['Spam Filtering', ['SPAMASSASSIN_MODE', 'POSTMARK_SPAMCHECK_URL', 'SPAMD_HOST', 'SPAMD_PORT', 'SPAMD_STARTUP_ATTEMPTS', 'SPAMC_TIMEOUT_MS', 'SPAMC_FAIL_OPEN', 'SA_BLOCK_THRESHOLD', 'SA_QUESTIONABLE_THRESHOLD', 'SPAM_SCL_SCORE', 'SPAM_SUBJECT_TAG']],
     ['Plugin Settings', Object.keys(config.pluginSecretEnvironment || {})]
   ];
+  const sectionKeys = new Set(sections.flatMap(([, keys]) => keys));
+  sections.push(['Additional Settings', Object.keys(env).filter(name => !sectionKeys.has(name))]);
   const envText = sections.map(([label, keys]) => `# ${label}\n${keys.map((key) => `${key}=${envValue(env[key])}`).join('\n')}`).join('\n\n') + '\n';
-  const wranglerText = `name = ${tomlValue(config.workerName)}\nmain = ${tomlValue(config.workerMain || 'worker.js')}\ncompatibility_date = "2026-05-19"\npreview_urls = false\n\n[vars]\nNODE_APP_URL = ${tomlValue(`https://${config.hostname}/api/webhook/email`)}\nMAIL_STORE_ENCRYPTION_VERSION = "v1"\n\n[[r2_buckets]]\nbinding = "MAIL_STORE"\nbucket_name = ${tomlValue(config.r2BucketName)}\n\n[[queues.producers]]\nbinding = "MAIL_QUEUE"\nqueue = ${tomlValue(config.queueName)}\n\n[[queues.consumers]]\nqueue = ${tomlValue(config.queueName)}\nmax_batch_size = 10\nmax_batch_timeout = 5\nmax_retries = 3\n\n[[send_email]]\nname = "EMAIL"\n`;
+  const wranglerText = `name = ${tomlValue(config.workerName)}\nmain = ${tomlValue(config.workerMain || 'worker.js')}\ncompatibility_date = "2026-10-21"\npreview_urls = false\n\n[vars]\nNODE_APP_URL = ${tomlValue(`https://${config.hostname}/api/webhook/email`)}\nMAIL_STORE_ENCRYPTION_VERSION = "v1"\n\n[[r2_buckets]]\nbinding = "MAIL_STORE"\nbucket_name = ${tomlValue(config.r2BucketName)}\n\n[[queues.producers]]\nbinding = "MAIL_QUEUE"\nqueue = ${tomlValue(config.queueName)}\n\n[[queues.consumers]]\nqueue = ${tomlValue(config.queueName)}\nmax_batch_size = 10\nmax_batch_timeout = 5\nmax_retries = 3\ndead_letter_queue = ${tomlValue(deadLetterQueueName)}\n\n[[send_email]]\nname = "EMAIL"\n`;
 
-  return { envText, wranglerText, queueMasterKey, webhookSecret, cloudflareSendSecret, publicKey: generated.publicKey || '', r2BucketName: config.r2BucketName, queueName: config.queueName };
+  return { envText, wranglerText, queueMasterKey, webhookSecret, cloudflareSendSecret, publicKey: generated.publicKey || '', r2BucketName: config.r2BucketName, queueName: config.queueName, deadLetterQueueName };
 }
 
 async function runSetup({
@@ -186,45 +288,68 @@ async function runSetup({
   };
 
   try {
-    output.write(`\nMailbridge interactive setup${systemMode ? ' (system package)' : ''}\nPress Enter to accept the value shown in brackets.\n\n`);
-    const hostname = await ask('Public Mailbridge hostname', 'mailbridge.example.com');
-    const workerName = await ask('Cloudflare Worker name', 'mailbridge-worker');
-    const localMailHost = await ask('Local/private SMTP host', 'mail.internal.example');
-    const localMailPort = Number.parseInt(await ask('Local/private SMTP port', '25'), 10);
-    if (!Number.isInteger(localMailPort) || localMailPort < 1 || localMailPort > 65535) throw new Error('SMTP port must be between 1 and 65535');
-    const localMailRequireTls = await askBoolean('Require STARTTLS for local mail delivery', true);
-    const localMailTlsServername = localMailRequireTls ? await ask('TLS server name (blank uses SMTP host)', '') : '';
-    const pathContext = systemMode ? 'on this host' : 'inside container';
-    const localMailTlsCaFile = localMailRequireTls ? await ask(`Custom CA file ${pathContext} (optional)`, '') : '';
-    const spamAssassinMode = await askChoice('Spam filtering mode', ['local', 'postmark'], 'local');
-    let upstreamProvider = await askChoice('Outbound provider', ['sendgrid', 'resend', 'mailgun', 'cloudflare', 'community'], 'sendgrid');
     const targets = [envFileName, 'wrangler.toml'].map((name) => path.join(cwd, name));
-    const existing = targets.filter((target) => fs.existsSync(target));
-    if (existing.length && !await askBoolean(`Overwrite ${existing.map((file) => path.basename(file)).join(' and ')}`, false)) {
-      output.write('No files changed.\n');
-      return { written: false };
-    }
+    const existingContents = targets.map(target => readOptionalFile(target));
+    const existing = targets.filter((target, index) => existingContents[index] !== undefined);
+    const existingEnv = existingContents[0] === undefined ? {} : parseEnv(existingContents[0]);
+    Object.values(existingEnv).forEach(envValue);
+    const existingBoolean = (name, fallback) => existingEnv[name] === undefined ? fallback : existingEnv[name].toLowerCase() === 'true';
     const pluginManager = createPluginManager({
       pluginDirectory,
       lockfilePath: pluginLockfile,
       log: (scope, message, details) => output.write(`${scope} ${message} ${JSON.stringify(details)}\n`)
     });
+    const installedProviders = pluginManager.discover().filter(plugin => plugin.manifest.type === 'provider').map(plugin => plugin.manifest.id);
+    output.write(`\nMailbridge interactive setup${systemMode ? ' (system package)' : ''}\nPress Enter to accept the value shown in brackets.\n\n`);
+    const hostname = await ask('Public Mailbridge hostname', existingEnv.MAILBRIDGE_HOSTNAME || 'mailbridge.example.com');
+    const workerName = await ask('Cloudflare Worker name', 'mailbridge-worker');
+    const localMailHost = await ask('Local/private SMTP host', existingEnv.LOCAL_MAIL_HOST || 'mail.internal.example');
+    const localMailPort = Number.parseInt(await ask('Local/private SMTP port', existingEnv.LOCAL_MAIL_PORT || '25'), 10);
+    if (!Number.isInteger(localMailPort) || localMailPort < 1 || localMailPort > 65535) throw new Error('SMTP port must be between 1 and 65535');
+    const localMailRequireTls = await askBoolean('Require STARTTLS for local mail delivery', existingBoolean('LOCAL_MAIL_REQUIRE_TLS', true));
+    const localMailTlsServername = localMailRequireTls ? await ask('TLS server name (blank uses SMTP host)', existingEnv.LOCAL_MAIL_TLS_SERVERNAME || '') : '';
+    const pathContext = systemMode ? 'on this host' : 'inside container';
+    const localMailTlsCaFile = localMailRequireTls ? await ask(`Custom CA file ${pathContext} (optional)`, existingEnv.LOCAL_MAIL_TLS_CA_FILE || '') : '';
+    const spamAssassinMode = await askChoice('Spam filtering mode', ['local', 'postmark'], existingEnv.SPAMASSASSIN_MODE || 'local');
+    const providerChoices = [...new Set(['sendgrid', 'resend', 'mailgun', 'cloudflare', 'community', ...installedProviders])];
+    let upstreamProvider = await askChoice('Outbound provider', providerChoices, providerChoices.includes(existingEnv.RELAY_UPSTREAM_PROVIDER) ? existingEnv.RELAY_UPSTREAM_PROVIDER : 'cloudflare');
+    if (existing.length && !await askBoolean(`Overwrite ${existing.map((file) => path.basename(file)).join(' and ')}`, false)) {
+      output.write('No files changed.\n');
+      return { written: false };
+    }
+    const activeDataDirectory = configuredHostPath(existingEnv.DATA_DIR, runtimePaths.dataDir || '/app/data', dataDirectory, cwd);
+    const queueDirectory = path.join(activeDataDirectory, 'queue');
+    if (!existingEnv.QUEUE_MASTER_KEY) {
+      let queueFiles = [];
+      try { queueFiles = fs.readdirSync(queueDirectory); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (queueFiles.some(name => name.endsWith('.eml'))) throw new Error('Existing queued mail requires its original QUEUE_MASTER_KEY. Restore the configuration before rerunning setup.');
+    }
+    const defaultPrivateKeyPath = path.join(keyDirectory, 'mailbridge-r2-private.pem');
+    const activePrivateKeyPath = configuredHostPath(existingEnv.MAILBRIDGE_PRIVATE_KEY_PATH, runtimePaths.privateKeyPath || '/app/secrets/mailbridge-r2-private.pem', defaultPrivateKeyPath, cwd);
+    const usesCustomPrivateKey = path.resolve(activePrivateKeyPath) !== path.resolve(defaultPrivateKeyPath);
+    const publicKeyPath = path.join(keyDirectory, usesCustomPrivateKey ? 'mailbridge-active-public.pem' : 'mailbridge-r2-public.pem');
+    const activeKeys = existingEnv.MAILBRIDGE_PRIVATE_KEY_PATH
+      ? (usesCustomPrivateKey ? { publicKey: publicKeyFromPrivateFile(activePrivateKeyPath) } : loadKeyPair(activePrivateKeyPath, publicKeyPath))
+      : null;
     const selectedPlugins = [];
-    const pluginConfiguration = {};
-    const pluginSecretEnvironment = {};
+    const pluginConfigPath = path.join(path.dirname(pluginLockfile), 'plugins.config.json');
+    const pluginConfigurationContents = readOptionalFile(pluginConfigPath);
+    const pluginConfiguration = pluginConfigurationContents === undefined ? {} : JSON.parse(pluginConfigurationContents);
+    const pluginSecretEnvironment = Object.fromEntries(Object.entries(existingEnv).filter(([name]) => /^MAILBRIDGE_PLUGIN_/.test(name) && !['MAILBRIDGE_PLUGIN_DIR', 'MAILBRIDGE_PLUGIN_LOCKFILE', 'MAILBRIDGE_PLUGIN_CONFIG_FILE'].includes(name)));
     const promptPluginSchema = async (installed) => {
       const fields = installed.manifest.config;
       const names = Array.isArray(fields) ? fields : Object.keys(fields || {});
       const values = {};
       for (const name of names) {
         const schema = Array.isArray(fields) ? {} : (fields[name] || {});
-        values[name] = await ask(`${installed.manifest.id} ${name}`, schema.default ?? '');
+        values[name] = await ask(`${installed.manifest.id} ${name}`, pluginConfiguration[installed.manifest.id]?.[name] ?? schema.default ?? '');
       }
       if (names.length) pluginConfiguration[installed.manifest.id] = values;
       const secretFields = installed.manifest.secrets;
       const secretNames = Array.isArray(secretFields) ? secretFields : Object.keys(secretFields || {});
       const prefix = `MAILBRIDGE_PLUGIN_${installed.manifest.id.toUpperCase().replace(/-/g, '_')}_`;
-      for (const name of secretNames) pluginSecretEnvironment[`${prefix}${name}`] = await ask(`${installed.manifest.id} ${name} (secret)`, '');
+      for (const name of secretNames) pluginSecretEnvironment[`${prefix}${name}`] = await ask(`${installed.manifest.id} ${name} (secret; blank keeps existing)`, '') || pluginSecretEnvironment[`${prefix}${name}`] || '';
     };
     const installSelectedPlugin = async (label, defaultSpecifier) => {
       if (!await askBoolean(`Enable ${label} plugin`, false)) return;
@@ -233,11 +358,11 @@ async function runSetup({
       await promptPluginSchema(installed);
       selectedPlugins.push(label.toLowerCase());
     };
-    await installSelectedPlugin('Spamhaus', 'mailbridge-plugin-spamhaus@1.0.0');
-    await installSelectedPlugin('Codex AI scanning', 'mailbridge-plugin-codex@1.0.0');
-    if (['sendgrid', 'resend', 'mailgun'].includes(upstreamProvider)) {
+    await installSelectedPlugin('Spamhaus', '');
+    await installSelectedPlugin('Codex AI scanning', '');
+    if (['sendgrid', 'resend', 'mailgun'].includes(upstreamProvider) && !installedProviders.includes(upstreamProvider)) {
       const pluginName = upstreamProvider[0].toUpperCase() + upstreamProvider.slice(1);
-      const providerSpecifier = assertExactPackageSpecifier(await ask(`Exact npm package/version for ${pluginName}`, `mailbridge-plugin-${upstreamProvider}@1.0.0`));
+      const providerSpecifier = assertExactPackageSpecifier(await ask(`Exact npm package/version for ${pluginName}`));
       const installed = pluginManager.install(providerSpecifier);
       await promptPluginSchema(installed);
       selectedPlugins.push(upstreamProvider);
@@ -255,55 +380,50 @@ async function runSetup({
       await promptPluginSchema(installed);
       selectedPlugins.push(installed.manifest.id);
     }
-    const relayFrom = await ask('Fallback outbound From address', `postmaster@${hostname}`);
-    const workerSendUrl = upstreamProvider === 'cloudflare' ? await ask('Deployed Worker send URL') : '';
-    const smtpRelayEnabled = await askBoolean('Enable the trusted outbound SMTP relay', false);
-    const allowedCidrs = smtpRelayEnabled ? await ask('Allowed relay CIDRs', '127.0.0.1/32,::1/128') : '127.0.0.1/32,::1/128';
+    const relayFrom = await ask('Fallback outbound From address', existingEnv.RELAY_FROM_FALLBACK || `postmaster@${hostname}`);
+    const workerSendUrl = upstreamProvider === 'cloudflare' ? await ask('Deployed Worker send URL', existingEnv.CLOUDFLARE_SEND_WORKER_URL || '') : '';
+    const smtpRelayEnabled = await askBoolean('Enable the trusted outbound SMTP relay', existingBoolean('SMTP_RELAY_ENABLED', false));
+    const allowedCidrs = smtpRelayEnabled ? await ask('Allowed relay CIDRs', existingEnv.SMTP_RELAY_ALLOWED_CIDRS || '127.0.0.1/32,::1/128') : '127.0.0.1/32,::1/128';
     let smtpRelayRequireTls = true;
     let smtpRelayAllowInsecure = false;
     let smtpRelayTlsCertFile = '';
     let smtpRelayTlsKeyFile = '';
     let smtpRelayTlsCaFile = '';
     if (smtpRelayEnabled) {
-      smtpRelayRequireTls = await askBoolean('Require STARTTLS for relay clients', true);
+      smtpRelayRequireTls = await askBoolean('Require STARTTLS for relay clients', existingBoolean('SMTP_RELAY_REQUIRE_TLS', true));
       if (smtpRelayRequireTls) {
-        smtpRelayTlsCertFile = await ask(`Relay TLS certificate file ${pathContext}`);
-        smtpRelayTlsKeyFile = await ask(`Relay TLS private-key file ${pathContext}`);
-        smtpRelayTlsCaFile = await ask(`Relay TLS CA file ${pathContext} (optional)`, '');
+        smtpRelayTlsCertFile = await ask(`Relay TLS certificate file ${pathContext}`, existingEnv.SMTP_RELAY_TLS_CERT_FILE || '');
+        smtpRelayTlsKeyFile = await ask(`Relay TLS private-key file ${pathContext}`, existingEnv.SMTP_RELAY_TLS_KEY_FILE || '');
+        smtpRelayTlsCaFile = await ask(`Relay TLS CA file ${pathContext} (optional)`, existingEnv.SMTP_RELAY_TLS_CA_FILE || '');
         if (!smtpRelayTlsCertFile || !smtpRelayTlsKeyFile) throw new Error('Relay TLS certificate and key paths are required when STARTTLS is required');
       } else {
-        smtpRelayAllowInsecure = await askBoolean('Explicitly allow plaintext relay traffic', false);
+        smtpRelayAllowInsecure = await askBoolean('Explicitly allow plaintext relay traffic', existingBoolean('SMTP_RELAY_ALLOW_INSECURE', false));
         if (!smtpRelayAllowInsecure) throw new Error('Relay setup stopped: enable STARTTLS or explicitly allow plaintext relay traffic');
       }
     }
-    const cloudflaredEnabled = systemMode ? false : await askBoolean('Run an in-container Cloudflare Tunnel', false);
-    const cloudflareTunnelToken = cloudflaredEnabled ? await ask('Cloudflare Tunnel token') : '';
+    const cloudflaredEnabled = systemMode ? false : await askBoolean('Run an in-container Cloudflare Tunnel', existingBoolean('CLOUDFLARED_ENABLED', false));
+    const cloudflareTunnelToken = cloudflaredEnabled ? (await ask('Cloudflare Tunnel token (blank keeps existing)') || existingEnv.CLOUDFLARED_TUNNEL_TOKEN || '') : '';
     if (cloudflaredEnabled && !cloudflareTunnelToken) throw new Error('A tunnel token is required when the in-container tunnel is enabled');
     const r2BucketName = await ask('R2 bucket name', 'mailbridge-inbound');
     const queueName = await ask('Cloudflare Queue name', 'mailbridge-inbound');
 
-    const keyDir = keyDirectory;
-    const privateKeyPath = path.join(keyDir, 'mailbridge-r2-private.pem');
-    const publicKeyPath = path.join(keyDir, 'mailbridge-r2-public.pem');
-    let keys;
-    if (fs.existsSync(privateKeyPath) || fs.existsSync(publicKeyPath)) {
-      if (!fs.existsSync(privateKeyPath) || !fs.existsSync(publicKeyPath)) throw new Error('Only one Mailbridge key file exists; restore the pair before running setup');
-    } else {
-      keys = generateKeyPair();
+    const artifacts = generateArtifacts({ hostname, workerName, localMailHost, localMailPort, localMailRequireTls, localMailTlsServername, localMailTlsCaFile, spamAssassinMode, upstreamProvider, relayFrom, workerSendUrl, smtpRelayEnabled, allowedCidrs, smtpRelayRequireTls, smtpRelayAllowInsecure, smtpRelayTlsCertFile, smtpRelayTlsKeyFile, smtpRelayTlsCaFile, cloudflaredEnabled, cloudflareTunnelToken, r2BucketName, queueName, pluginDirectory, pluginLockfile, pluginConfigFile: pluginConfigPath, pluginSecretEnvironment, existingEnvironment: existingEnv, ...runtimePaths }, {
+      queueMasterKey: existingEnv.QUEUE_MASTER_KEY,
+      webhookSecret: existingEnv.WEBHOOK_SECRET,
+      cloudflareSendSecret: existingEnv.CLOUDFLARE_SEND_WEBHOOK_SECRET || existingEnv.WEBHOOK_SECRET,
+      publicKey: activeKeys?.publicKey || ''
+    });
+    const keys = activeKeys || createOrLoadKeyPair(keyDirectory);
+    artifacts.publicKey = keys.publicKey;
+    if (usesCustomPrivateKey) {
+      fs.mkdirSync(keyDirectory, { recursive: true, mode: 0o700 });
+      writeFileAtomic(publicKeyPath, keys.publicKey, 0o644);
     }
-
-    const artifacts = generateArtifacts({ hostname, workerName, localMailHost, localMailPort, localMailRequireTls, localMailTlsServername, localMailTlsCaFile, spamAssassinMode, upstreamProvider, relayFrom, workerSendUrl, smtpRelayEnabled, allowedCidrs, smtpRelayRequireTls, smtpRelayAllowInsecure, smtpRelayTlsCertFile, smtpRelayTlsKeyFile, smtpRelayTlsCaFile, cloudflaredEnabled, cloudflareTunnelToken, r2BucketName, queueName, pluginDirectory, pluginLockfile, pluginConfigFile: path.join(path.dirname(pluginLockfile), 'plugins.config.json'), pluginSecretEnvironment, ...runtimePaths }, { publicKey: keys?.publicKey || (fs.existsSync(publicKeyPath) ? fs.readFileSync(publicKeyPath, 'utf8') : '') });
-    fs.writeFileSync(path.join(path.dirname(pluginLockfile), 'plugins.config.json'), `${JSON.stringify(pluginConfiguration, null, 2)}\n`, { mode: 0o644 });
-    fs.mkdirSync(path.join(dataDirectory, 'queue'), { recursive: true, mode: 0o700 });
-    fs.mkdirSync(keyDir, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(targets[0], artifacts.envText, { mode: 0o600 });
-    fs.writeFileSync(targets[1], artifacts.wranglerText, { mode: 0o600 });
-    fs.chmodSync(targets[0], 0o600);
-    fs.chmodSync(targets[1], 0o600);
-    if (keys) {
-      fs.writeFileSync(privateKeyPath, keys.privateKey, { mode: 0o600, flag: 'wx' });
-      fs.writeFileSync(publicKeyPath, keys.publicKey, { mode: 0o644, flag: 'wx' });
-    }
+    fs.mkdirSync(path.dirname(pluginConfigPath), { recursive: true, mode: 0o700 });
+    writeFileAtomic(pluginConfigPath, `${JSON.stringify(pluginConfiguration, null, 2)}\n`, 0o644);
+    fs.mkdirSync(queueDirectory, { recursive: true, mode: 0o700 });
+    writeFileAtomic(targets[0], artifacts.envText, 0o600);
+    writeFileAtomic(targets[1], artifacts.wranglerText, 0o600);
 
     const npxCommand = systemMode ? '/opt/mailbridge/node/bin/npx' : 'npx';
     output.write(`\nConfiguration generated. Secrets were written to ${envFileName}.\n`);
@@ -316,21 +436,23 @@ async function runSetup({
       } catch (error) {
         output.write(`Automatic Worker deployment failed: ${error.message}\n`);
         output.write('The generated configuration is preserved. Use the manual commands below.\n');
-        output.write(`  ${npxCommand} --yes wrangler r2 bucket create ${r2BucketName}\n`);
-        output.write(`  ${npxCommand} --yes wrangler queues create ${queueName}\n`);
-        output.write(`  ${npxCommand} --yes wrangler secret put WEBHOOK_SECRET\n`);
-        output.write(`  ${npxCommand} --yes wrangler secret put CLOUDFLARE_SEND_WEBHOOK_SECRET\n`);
-        output.write(`  ${npxCommand} --yes wrangler secret put MAILBRIDGE_PUBLIC_KEY_PEM < ${publicKeyPath}\n`);
-        output.write(`  ${npxCommand} --yes wrangler deploy\n`);
+        output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} r2 bucket create ${r2BucketName}\n`);
+        output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} queues create ${queueName}\n`);
+        output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} queues create ${artifacts.deadLetterQueueName}\n`);
+        output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} secret put WEBHOOK_SECRET\n`);
+        output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} secret put CLOUDFLARE_SEND_WEBHOOK_SECRET\n`);
+        output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} secret put MAILBRIDGE_PUBLIC_KEY_PEM < ${publicKeyPath}\n`);
+        output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} deploy\n`);
       }
     } else {
-      output.write('\nWorker deployment skipped. Enter these values when Wrangler prompts for Worker secrets:\n');
-      output.write(`  WEBHOOK_SECRET=${artifacts.webhookSecret}\n`);
-      output.write(`  CLOUDFLARE_SEND_WEBHOOK_SECRET=${artifacts.cloudflareSendSecret}\n`);
-      output.write(`  MAILBRIDGE_PUBLIC_KEY_PEM=\n${artifacts.publicKey}\n`);
-      output.write(`  ${npxCommand} --yes wrangler r2 bucket create ${r2BucketName}\n`);
-      output.write(`  ${npxCommand} --yes wrangler queues create ${queueName}\n`);
-      output.write(`  ${npxCommand} --yes wrangler deploy\n`);
+      output.write(`\nWorker deployment skipped. Read webhook secrets privately from ${envFileName} when Wrangler prompts; the private key stays on this host.\n`);
+      output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} secret put WEBHOOK_SECRET\n`);
+      output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} secret put CLOUDFLARE_SEND_WEBHOOK_SECRET\n`);
+      output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} secret put MAILBRIDGE_PUBLIC_KEY_PEM < ${publicKeyPath}\n`);
+      output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} r2 bucket create ${r2BucketName}\n`);
+      output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} queues create ${queueName}\n`);
+      output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} queues create ${artifacts.deadLetterQueueName}\n`);
+      output.write(`  ${npxCommand} --yes ${WRANGLER_PACKAGE} deploy\n`);
     }
     output.write(systemMode ? '  systemctl enable --now mailbridge\n' : '  docker compose up -d --build\n');
     return { written: true, ...artifacts };

@@ -81,3 +81,19 @@ test('mailbridge rejects decrypted payloads with non-string mail fields', async 
     /missing required mail fields/
   );
 });
+
+test('a valid envelope encrypted for another key is retained for configuration recovery', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-crypto-key-mismatch-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const senderKeys = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const wrongKeys = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const keyPath = path.join(root, 'fixture.pem');
+  fs.writeFileSync(keyPath, wrongKeys.privateKey.export({ type: 'pkcs8', format: 'pem' }));
+  const envelope = await encryptPayloadWithPublicKey({ publicKeyPem: senderKeys.publicKey.export({ type: 'spki', format: 'pem' }),
+    payload: { from: '', to: 'recipient@example.com', raw: 'Subject: notice\r\n\r\nSynthetic notification' } });
+  assert.throws(() => createInboundMessageDecryptor({ privateKeyPath: keyPath }).decryptPayload(envelope), error => {
+    assert.equal(error.statusCode, 503);
+    assert.equal(error.permanent, false);
+    return true;
+  });
+});

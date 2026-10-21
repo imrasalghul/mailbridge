@@ -4,6 +4,7 @@ const DEFAULT_BRIDGE_WEBHOOK_PATH = "/api/webhook/email";
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (url.pathname === "/api/replay/email") return handleReplayRequest(request, env);
     if (url.pathname !== "/api/send/email") {
       return new Response("Not found", { status: 404 });
     }
@@ -101,8 +102,11 @@ export default {
           headers: {
             "Content-Type": "application/json",
             "X-Webhook-Secret": env.WEBHOOK_SECRET,
+            "X-Mailbridge-Delivery-Id": objectKey,
           },
           body: JSON.stringify(requestBody),
+          redirect: "error",
+          signal: AbortSignal.timeout(120000),
         });
 
         if (response.ok) {
@@ -112,13 +116,10 @@ export default {
           continue;
         }
 
-        const errorText = await safeReadText(response);
-
-        if (response.status >= 500 || response.status === 429) {
+        if (![400, 406, 413, 422].includes(response.status)) {
           console.error("temporary bridge failure", {
             objectKey,
             status: response.status,
-            errorText,
           });
           msg.retry({ delaySeconds: getRetryDelaySeconds(msg.attempts) });
           continue;
@@ -127,7 +128,6 @@ export default {
         console.error("permanent bridge failure", {
           objectKey,
           status: response.status,
-          errorText,
         });
         await deleteStoredMessageOrRetry({
           env,
@@ -174,14 +174,10 @@ async function handleSendEmailRequest(request, env) {
     return jsonResponse({ success: true, messageId: result?.messageId || null });
   } catch (err) {
     const status = mapEmailSendErrorStatus(err);
-    console.error("EMAIL.send failed", {
-      code: err?.code || null,
-      message: err?.message || String(err),
-    });
+    console.error("EMAIL.send failed", JSON.stringify({ status }));
     return jsonResponse({
       success: false,
-      code: err?.code || null,
-      error: err?.message || String(err),
+      error: status === 400 ? "Email rejected by provider" : "Email provider temporarily unavailable",
     }, status);
   }
 }
@@ -191,11 +187,43 @@ function mapEmailSendErrorStatus(err) {
     case "E_RATE_LIMIT_EXCEEDED":
     case "E_DAILY_LIMIT_EXCEEDED":
       return 429;
-    case "E_INTERNAL_SERVER_ERROR":
-    case "E_DELIVERY_FAILED":
-      return 502;
-    default:
+    case "E_VALIDATION_ERROR":
+    case "E_FIELD_MISSING":
+    case "E_TOO_MANY_RECIPIENTS":
+    case "E_TOO_MANY_ATTACHMENTS":
+    case "E_RECIPIENT_SUPPRESSED":
+    case "E_CONTENT_TOO_LARGE":
+    case "E_HEADER_NOT_ALLOWED":
+    case "E_HEADER_USE_API_FIELD":
+    case "E_HEADER_VALUE_INVALID":
+    case "E_HEADER_VALUE_TOO_LONG":
+    case "E_HEADER_NAME_INVALID":
+    case "E_HEADERS_TOO_LARGE":
+    case "E_HEADERS_TOO_MANY":
       return 400;
+    default:
+      return 502;
+  }
+}
+
+async function handleReplayRequest(request, env) {
+  if (request.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405);
+  if (!env.WEBHOOK_SECRET) return jsonResponse({ error: "Server misconfiguration" }, 503);
+  if (request.headers.get("X-Webhook-Secret") !== env.WEBHOOK_SECRET) return jsonResponse({ error: "Invalid Secret" }, 403);
+  let payload;
+  try { payload = await request.json(); }
+  catch { return jsonResponse({ error: "Invalid JSON" }, 400); }
+  if (typeof payload?.objectKey !== "string" || !/^inbound\/\d{4}-\d{2}-\d{2}\/[a-zA-Z0-9-]+\.bin$/.test(payload.objectKey)) {
+    return jsonResponse({ error: "Invalid object key" }, 400);
+  }
+  try {
+    const object = await env.MAIL_STORE.get(payload.objectKey);
+    if (!object) return jsonResponse({ error: "Stored message not found" }, 404);
+    if (object.customMetadata?.encryptionVersion !== "v1") return jsonResponse({ error: "Unsupported stored encryption version" }, 422);
+    await env.MAIL_QUEUE.send({ objectKey: payload.objectKey, encryptionVersion: "v1" });
+    return jsonResponse({ success: true }, 202);
+  } catch {
+    return jsonResponse({ error: "Recovery temporarily unavailable" }, 503);
   }
 }
 
@@ -341,11 +369,3 @@ export {
   buildBridgeEndpointUrl,
   DEFAULT_BRIDGE_WEBHOOK_PATH,
 };
-
-async function safeReadText(response) {
-  try {
-    return await response.text();
-  } catch {
-    return "";
-  }
-}

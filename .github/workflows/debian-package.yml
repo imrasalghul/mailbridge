@@ -13,20 +13,20 @@ jobs:
   build-amd64:
     runs-on: ubuntu-24.04
     # Build against the only published target: Debian 13 (Trixie).
-    container: debian:trixie-slim
+    container: debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
     steps:
       - name: Install build tools
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl dpkg-dev git g++ make python3 xz-utils
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build package
         run: packaging/debian/build-deb.sh
       - name: Inspect package
         run: |
           dpkg-deb --info dist/debian/mailbridge_*_amd64.deb
           dpkg-deb --contents dist/debian/mailbridge_*_amd64.deb
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mailbridge-debian-amd64
           path: dist/debian/mailbridge_*_amd64.deb

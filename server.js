@@ -5,6 +5,10 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
+const { randomUUID } = require('node:crypto');
+const { createDeliveryReceiptStore } = require('./lib/delivery-receipts');
+const { deliverInboundMessage } = require('./lib/inbound-delivery');
+const { createWebhookHandler } = require('./lib/webhook-handler');
 
 const { createAuditLogStore } = require('./lib/audit-log-store');
 const { createCloudflareDelivery } = require('./lib/cloudflare-delivery');
@@ -24,7 +28,6 @@ const {
 } = require('./lib/spam-pipeline');
 const { buildSmtpRelayPolicy } = require('./lib/smtp-relay-policy');
 const { createSmtpRelayServer } = require('./lib/smtp-relay-server');
-const { validateWebhookRequest } = require('./lib/webhook-intake');
 
 function parseBoolean(value, defaultValue) {
   if (value === undefined || value === null || value === '') return defaultValue;
@@ -63,7 +66,7 @@ try {
   const configPath = process.env.MAILBRIDGE_PLUGIN_CONFIG_FILE || path.join(dataDir, 'plugins.config.json');
   if (configPath && fs.existsSync(configPath)) pluginConfigFile = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 } catch (error) {
-  console.warn(`[Plugin] Ignoring invalid plugin config file: ${error.message}`);
+  console.warn(JSON.stringify(`[Plugin] Ignoring invalid plugin config file: ${error.message}`));
 }
 
 function pluginEnvironment(manifest) {
@@ -91,7 +94,7 @@ async function invokeCapability(type, capability, operation, payload) {
       results.push({ plugin: manifest, result: response.result || {} });
     } catch (error) {
       if (manifest.failurePolicy === 'fail-closed') throw error;
-      console.warn(`[${payload.requestId}] Plugin ${manifest.id} failed open: ${error.message}`);
+      console.warn(JSON.stringify(`[${payload.requestId}] Plugin ${manifest.id} failed open: ${error.message}`));
     }
   }
   return results;
@@ -116,7 +119,7 @@ async function applyMiddlewarePlugins({ requestId, from, to, rawEmail, sourceIp 
       if (typeof result.to === 'string') current.to = result.to;
     } catch (error) {
       if (manifest.failurePolicy === 'fail-closed') throw error;
-      console.warn(`[${requestId}] Middleware ${manifest.id} failed open: ${error.message}`);
+      console.warn(JSON.stringify(`[${requestId}] Middleware ${manifest.id} failed open: ${error.message}`));
     }
   }
   return { rejected: false, ...current };
@@ -132,7 +135,7 @@ function logVerbose(scope, message, details = {}) {
       return `${key}=${value}`;
     })
     .join(' ');
-  console.log(`${scope} ${message}${formattedDetails ? ` ${formattedDetails}` : ''}`);
+  console.log(JSON.stringify(`${scope} ${message}${formattedDetails ? ` ${formattedDetails}` : ''}`));
 }
 
 function logSmtpRelay(scope, message, details = {}) {
@@ -155,6 +158,8 @@ async function start() {
     log: logVerbose
   });
   await auditStore.init();
+  const receiptStore = createDeliveryReceiptStore({ dbPath: path.join(dataDir, 'delivery-receipts.db') });
+  await receiptStore.init();
   const secretsDb = new sqlite3.Database(secretsDbPath);
 
   const queueStore = createQueueStore({
@@ -265,21 +270,8 @@ async function start() {
     });
   }
 
-  app.post('/api/webhook/email', async (req, res) => {
-    const requestId = Math.random().toString(36).substring(7);
-    const validation = validateWebhookRequest(req, process.env.WEBHOOK_SECRET);
-
-    if (!validation.ok) {
-      if (validation.statusCode === 403) {
-        logVerbose('[Webhook]', 'Rejected request due to invalid secret', {
-          requestId,
-          remoteAddress: validation.requestIp || req.ip
-        });
-      } else if (validation.statusCode === 500) {
-        console.error(`[${requestId}] WEBHOOK_SECRET is not configured`);
-      }
-      return res.status(validation.statusCode).send(validation.error);
-    }
+  const processWebhook = async (req, validation) => {
+    const requestId = randomUUID();
 
     let resolvedPayload = validation.payload;
     if (validation.payload.encryptedPayload) {
@@ -288,11 +280,11 @@ async function start() {
       } catch (error) {
         const statusCode = error.statusCode || 500;
         if (statusCode >= 500) {
-          console.error(`[${requestId}] Encrypted payload could not be processed: ${error.message}`);
+          console.error(JSON.stringify(`[${requestId}] Encrypted payload could not be processed`));
         } else {
-          console.warn(`[${requestId}] Invalid encrypted payload rejected: ${error.message}`);
+          console.warn(JSON.stringify(`[${requestId}] Invalid encrypted payload rejected`));
         }
-        return res.status(statusCode).send(error.message);
+        return { statusCode, body: statusCode >= 500 ? 'Encrypted mail processing unavailable' : 'Invalid encrypted payload' };
       }
     }
 
@@ -300,7 +292,6 @@ async function start() {
     const sourceIp = resolvedPayload.senderIp || validation.messageSourceIp;
     const requestIp = validation.requestIp;
 
-    console.log(`[${requestId}] Processing mail from ${from}`);
     logVerbose('[Webhook]', 'Inbound payload accepted', {
       requestId,
       from,
@@ -327,7 +318,7 @@ async function start() {
       const senderDomain = reputationCheck.senderDomain || extractDomainFromAddress(from);
 
       if (reputationCheck.blocked) {
-        console.warn(`[${requestId}] Rejected sender by reputation plugin. domain=${senderDomain || 'n/a'}`);
+        console.warn(JSON.stringify(`[${requestId}] Rejected sender by reputation plugin. domain=${senderDomain || 'n/a'}`));
         await auditStore.logEvent({
           requestId,
           eventType: 'reputation_plugin_blocked',
@@ -346,7 +337,7 @@ async function start() {
             pluginVersion: reputationCheck.pluginVersion
           }
         });
-        return res.status(406).send('Rejected by reputation filter');
+        return { statusCode: 406, body: 'Rejected by reputation filter' };
       }
 
       let spamAssassinResult;
@@ -354,7 +345,7 @@ async function start() {
         spamAssassinResult = await spamAssassinClient.checkMessage(raw, requestId);
         spamScore = spamAssassinResult.score;
       } catch (spamError) {
-        console.warn(`[${requestId}] ${spamError.message}. Falling back to classification plugins.`);
+        console.warn(JSON.stringify(`[${requestId}] ${spamError.message}. Falling back to classification plugins.`));
         spamSource = 'plugin-fallback';
         const classificationFallback = await classifyWithPlugins(raw, requestId);
         await logClassificationEvent({
@@ -373,7 +364,7 @@ async function start() {
         } else if (classificationFallback?.spam === '0') {
           spamReason = 'plugin_fallback_not_spam';
         } else if (!spamcFailOpen) {
-          console.error(`[${requestId}] SpamAssassin and classification plugins unavailable. Rejecting inbound mail (SPAMC_FAIL_OPEN=false).`);
+          console.error(JSON.stringify(`[${requestId}] SpamAssassin and classification plugins unavailable. Rejecting inbound mail (SPAMC_FAIL_OPEN=false).`));
           await auditStore.logEvent({
             requestId,
             eventType: 'delivery_failed',
@@ -386,9 +377,9 @@ async function start() {
             senderDomain,
             errorMessage: 'SpamAssassin and classification plugins unavailable'
           });
-          return res.status(503).send('Spam filter unavailable');
+          return { statusCode: 503, body: 'Spam filter unavailable' };
         } else {
-          console.warn(`[${requestId}] SpamAssassin and classification plugins unavailable. Continuing with fail-open behavior (SPAMC_FAIL_OPEN=true).`);
+          console.warn(JSON.stringify(`[${requestId}] SpamAssassin and classification plugins unavailable. Continuing with fail-open behavior (SPAMC_FAIL_OPEN=true).`));
           spamReason = 'fail_open';
         }
         spamAssassinResult = { score: 0 };
@@ -491,7 +482,7 @@ async function start() {
       const middlewareResult = await applyMiddlewarePlugins({ requestId, from, to, rawEmail: finalRaw, sourceIp });
       if (middlewareResult.rejected) {
         await auditStore.logEvent({ requestId, eventType: 'middleware_blocked', direction: 'inbound', target: 'local_mail', outcome: 'blocked', sender: from, recipient: to, sourceIp, errorMessage: middlewareResult.reason, details: { pluginId: middlewareResult.pluginId, pluginVersion: middlewareResult.pluginVersion } });
-        return res.status(406).send(`Rejected by middleware: ${middlewareResult.reason}`);
+        return { statusCode: 406, body: 'Rejected by middleware' };
       }
       const transformedFrom = middlewareResult.from;
       const transformedTo = middlewareResult.to;
@@ -503,61 +494,28 @@ async function start() {
         injectedHeaderLines: headers.split('\r\n').filter(Boolean).length
       });
 
-      try {
-        await localMailTransport.sendMail({
-          envelope: { from: transformedFrom, to: [transformedTo] },
-          raw: transformedRaw
-        });
-        await auditStore.logEvent({
-          requestId,
-          eventType: 'delivered',
-          direction: 'inbound',
-          target: 'local_mail',
-          outcome: 'delivered',
-          sender: from,
-          recipient: to,
-          sourceIp,
-          senderDomain
-        });
-        console.log(`[${requestId}] Direct delivery successful.`);
-        return res.status(200).send('OK');
-      } catch (deliveryError) {
-        const smtpCode = deliveryError.responseCode;
-        if (smtpCode && smtpCode >= 500) {
-          await auditStore.logEvent({
-            requestId,
-            eventType: 'delivery_failed',
-            direction: 'inbound',
-            target: 'local_mail',
-            outcome: 'permanent_failure',
-            sender: from,
-            recipient: to,
-            sourceIp,
-            senderDomain,
-            statusCode: smtpCode,
-            errorCode: deliveryError.code,
-            errorMessage: deliveryError.message
-          });
-          console.error(`[${requestId}] Local mail server permanent rejection: ${deliveryError.message}`);
-          return res.status(smtpCode).send(deliveryError.message);
-        }
-
-        console.warn(`[${requestId}] Local mail server offline/busy (${smtpCode || 'Timeout'}). Queueing...`);
-        await queueManager.addToQueue(transformedFrom, transformedTo, transformedRaw, 'local_mail', {
-          direction: 'inbound',
-          requestId,
-          sourceIp,
-          senderDomain
-        });
-        return res.status(202).send('Queued for later delivery');
-      }
+      return await deliverInboundMessage({
+        transport: localMailTransport, queueManager, auditStore,
+        from: transformedFrom, to: transformedTo, raw: transformedRaw,
+        context: { requestId, sourceIp, senderDomain }
+      });
     } catch (error) {
-      console.error(`[${requestId}] Error: ${error.message}`);
-      return res.status(500).send(error.message);
+      console.error(JSON.stringify(`[${requestId}] Error: ${error.message}`));
+      return { statusCode: 503, body: 'Mail processing temporarily unavailable' };
     }
-  });
+  };
+  app.post('/api/webhook/email', createWebhookHandler({
+    webhookSecret: process.env.WEBHOOK_SECRET, receiptStore, processWebhook
+  }));
 
-  app.listen(port, '0.0.0.0', () => console.log(`Mail Bridge HTTP listener running on port ${port}`));
+  app.use((error, req, res, next) => {
+    if (res.headersSent) return next(error);
+    const statusCode = error.type === 'entity.too.large' ? 413 : error.type === 'entity.parse.failed' ? 400 : 503;
+    res.type('text/plain').set('X-Content-Type-Options', 'nosniff').status(statusCode).send(
+      statusCode === 413 ? 'Payload too large' : statusCode === 400 ? 'Invalid JSON' : 'Mail processing temporarily unavailable'
+    );
+  });
+  const httpServer = app.listen(port, '0.0.0.0', () => console.log(`Mail Bridge HTTP listener running on port ${httpServer.address().port}`));
 
   if (smtpRelayEnabled) {
     const smtpRelayPolicy = buildSmtpRelayPolicy();
@@ -575,7 +533,7 @@ async function start() {
     });
 
     smtpRelayServer.listen(smtpRelayPort, '0.0.0.0', () => {
-      console.log(`Mail Bridge SMTP relay running on port ${smtpRelayPort}`);
+      console.log(JSON.stringify(`Mail Bridge SMTP relay running on port ${smtpRelayPort}`));
     });
   } else {
     console.log('Mail Bridge SMTP relay disabled. Set SMTP_RELAY_ENABLED=true to enable outbound relay.');
@@ -583,10 +541,10 @@ async function start() {
 }
 
 start().catch((error) => {
-  console.error(`[Startup] ${error?.message || error}`);
+  console.error(JSON.stringify(`[Startup] ${error?.message || error}`));
   process.exit(1);
 });
 
 process.on('unhandledRejection', (error) => {
-  console.error(`[Process] Unhandled rejection: ${error?.message || error}`);
+  console.error(JSON.stringify(`[Process] Unhandled rejection: ${error?.message || error}`));
 });

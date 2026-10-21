@@ -19,9 +19,6 @@ function randomMasterKey() {
 
 async function createHarness(t, options = {}) {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-queue-'));
-  t.after(() => {
-    fs.rmSync(rootDir, { recursive: true, force: true });
-  });
 
   const dataDir = path.join(rootDir, 'data');
   const secretsDir = path.join(rootDir, 'secrets');
@@ -63,6 +60,7 @@ async function createHarness(t, options = {}) {
 
   t.after(async () => {
     await cleanup();
+    fs.rmSync(rootDir, { recursive: true, force: true });
   });
 
   return {
@@ -101,6 +99,53 @@ test('429 remains temporary when no explicit permanent flag is provided', () => 
 
 test('smtp 5xx remains permanent when no explicit permanent flag is provided', () => {
   assert.equal(isPermanentDeliveryError({ responseCode: 550 }), true);
+});
+
+test('SMTP temporary responses and HTTP service failures remain retryable', () => {
+  for (const responseCode of [421, 450, 451, 452]) {
+    assert.equal(isPermanentDeliveryError({ responseCode }), false, `SMTP ${responseCode}`);
+  }
+  for (const statusCode of [408, 429, 500, 502, 503, 504]) {
+    assert.equal(isPermanentDeliveryError({ statusCode }), false, `HTTP ${statusCode}`);
+  }
+  assert.equal(isPermanentDeliveryError({ statusCode: 400 }), true);
+});
+
+test('queued mail survives an SMTP 451 and delivers on the next attempt', async (t) => {
+  const harness = await createHarness(t);
+  await harness.queueStore.addToQueue('', 'dest@example.com', 'Subject: DSN\r\n\r\nbody');
+  let calls = 0;
+  const manager = createQueueManager({
+    store: harness.queueStore, auditStore: harness.auditStore, maxQueueAttempts: 3,
+    async deliverQueuedMessage(message) {
+      assert.equal(message.sender, '');
+      if (++calls === 1) throw Object.assign(new Error('Try again later'), { responseCode: 451 });
+    }
+  });
+  await manager.processQueue();
+  assert.equal(await harness.queueStore.countQueueItems(), 1);
+  await manager.processQueue();
+  assert.equal(calls, 2);
+  assert.equal(await harness.queueStore.countQueueItems(), 0);
+});
+
+test('concurrent audit events form one continuous authenticated chain', async (t) => {
+  const harness = await createHarness(t);
+  await Promise.all(Array.from({ length: 10 }, (_, i) => harness.auditStore.logEvent({ eventType: 'delivered', requestId: `request-${i}` })));
+  const rows = await all(harness.auditStore.db, 'SELECT previous_event_hmac, event_hmac FROM audit_events ORDER BY id');
+  assert.equal(rows.length, 10);
+  assert.equal(rows[0].previous_event_hmac, null);
+  for (let i = 1; i < rows.length; i++) assert.equal(rows[i].previous_event_hmac, rows[i - 1].event_hmac);
+});
+
+test('persisted queue acceptance is not undone by an audit failure', async (t) => {
+  const harness = await createHarness(t);
+  harness.auditStore.logEvent = async () => { throw new Error('synthetic audit failure'); };
+  const id = await harness.queueStore.addToQueue('', 'dest@example.com', 'Subject: DSN\r\n\r\nbody');
+  assert.equal(typeof id, 'string');
+  const rows = await harness.queueStore.listQueueItems();
+  assert.equal(rows.length, 1);
+  assert.equal((await harness.queueStore.loadQueuedMessage(rows[0])).sender, '');
 });
 
 test('queued messages are encrypted at rest and db does not store raw content', async (t) => {

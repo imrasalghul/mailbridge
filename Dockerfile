@@ -1,4 +1,4 @@
-FROM node:22-trixie-slim AS deps
+FROM node:22.23.3-trixie-slim@sha256:154ba2f4d6fec323d28e4f4bb86bba4677f1223391a1979cf521304e03a98dfa AS deps
 
 ENV DEBIAN_FRONTEND=noninteractive \
     NODE_ENV=production \
@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-FROM node:22-trixie-slim
+FROM node:22.23.3-trixie-slim@sha256:154ba2f4d6fec323d28e4f4bb86bba4677f1223391a1979cf521304e03a98dfa
 
 ENV DEBIAN_FRONTEND=noninteractive \
     NODE_ENV=production \

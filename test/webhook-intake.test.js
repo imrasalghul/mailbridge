@@ -3,6 +3,13 @@ const assert = require('node:assert/strict');
 
 const { validateWebhookRequest } = require('../lib/webhook-intake');
 
+test('webhook accepts a null reverse path but rejects a missing sender', () => {
+  const req = { headers: { 'x-webhook-secret': 'secret' }, body: { from: '', to: 'dest@example.com', raw: 'Subject: DSN\r\n\r\nbody' } };
+  assert.equal(validateWebhookRequest(req, 'secret').ok, true);
+  delete req.body.from;
+  assert.equal(validateWebhookRequest(req, 'secret').statusCode, 400);
+});
+
 test('webhook validation prefers worker sender IP over Cloudflare request IP', () => {
   const result = validateWebhookRequest({
     headers: {

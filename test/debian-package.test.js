@@ -44,7 +44,7 @@ test('package scripts preserve configuration and queued mail across removal', ()
 
 test('Debian builder pins and verifies the bundled Node runtime', () => {
   const builder = read('packaging/debian/build-deb.sh');
-  assert.match(builder, /node_version="\$\{NODE_VERSION:-22\.23\.2\}"/);
+  assert.match(builder, /node_version="\$\{NODE_VERSION:-22\.23\.3\}"/);
   assert.match(builder, /SHASUMS256\.txt/);
   assert.match(builder, /sha256sum -c/);
   assert.match(builder, /npm ci --omit=dev/);
@@ -62,7 +62,17 @@ test('APT publisher preserves history and signs both repository metadata formats
   const workflow = read('.github/workflows/deploy-apt-repo.yml');
   assert.match(workflow, /aws s3 sync \"s3:\/\/\$\{R2_BUCKET_NAME\}\/\" apt-repo\//);
   assert.match(workflow, /aws s3 sync apt-repo\/ \"s3:\/\/\$\{R2_BUCKET_NAME\}\/\"/);
-  assert.match(workflow, /\.r2\.cloudflarestorage\.com/);
+  const endpointAssignments = workflow.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('endpoint="'));
+  assert.equal(endpointAssignments.length, 2);
+  for (const assignment of endpointAssignments) {
+    assert.ok(assignment.endsWith('"'));
+    const endpoint = new URL(assignment.slice('endpoint="'.length, -1)
+      .replace('${R2_ACCOUNT_ID}', 'test-account'));
+    assert.equal(endpoint.origin, 'https://test-account.r2.cloudflarestorage.com');
+    assert.equal(endpoint.pathname, '/');
+  }
   assert.match(workflow, /aws s3api head-bucket/);
   assert.match(workflow, /R2_ACCOUNT_ID: \$\{\{ vars\.R2_ACCOUNT_ID \}\}/);
   assert.match(workflow, /R2_BUCKET_NAME: \$\{\{ vars\.R2_BUCKET_NAME \}\}/);

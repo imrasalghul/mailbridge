@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 output_dir="${1:-${repo_dir}/dist/debian}"
-node_version="${NODE_VERSION:-22.23.2}"
+node_version="${NODE_VERSION:-22.23.3}"
 package_version="$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "${repo_dir}/package.json" | head -n 1)"
 architecture="$(dpkg --print-architecture)"
 

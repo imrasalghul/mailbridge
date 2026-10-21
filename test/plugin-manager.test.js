@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 
 const {
   assertExactPackageSpecifier,
@@ -110,6 +111,39 @@ test('plugin removal keeps the non-secret lockfile readable by the runtime user'
   fs.writeFileSync(lockfilePath, JSON.stringify({ apiVersion: 1, plugins: { 'remove-me': { package: 'remove-me', version: '1.0.0', integrity: 'sha512-test' } } }));
   const manager = createPluginManager({ pluginDirectory: root, lockfilePath });
   assert.deepEqual(manager.remove('remove-me'), { id: 'remove-me', removed: true });
-  assert.equal(fs.statSync(lockfilePath).mode & 0o777, 0o644);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(lockfilePath).mode & 0o777, 0o644);
+  fs.accessSync(lockfilePath, fs.constants.R_OK);
   assert.equal(manager.loadLockfile().plugins['remove-me'], undefined);
+});
+
+test('plugin removal atomically replaces the lockfile without overwriting another hard link', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-remove-linked-lock-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const pluginDirectory = path.join(root, 'remove-me');
+  const lockfilePath = path.join(root, 'plugins.lock.json');
+  const preservedPath = path.join(root, 'preserved.lock.json');
+  fs.mkdirSync(pluginDirectory);
+  fs.writeFileSync(path.join(pluginDirectory, 'mailbridge-plugin.json'), JSON.stringify({ apiVersion: 1, id: 'remove-me', version: '1.0.0', type: 'middleware', failurePolicy: 'fail-open', entrypoint: 'index.js', config: {}, secrets: {} }));
+  const original = JSON.stringify({ apiVersion: 1, plugins: { 'remove-me': { version: '1.0.0' } } });
+  fs.writeFileSync(lockfilePath, original);
+  fs.linkSync(lockfilePath, preservedPath);
+  const manager = createPluginManager({ pluginDirectory: root, lockfilePath });
+  assert.deepEqual(manager.remove('remove-me'), { id: 'remove-me', removed: true });
+  assert.equal(fs.readFileSync(preservedPath, 'utf8'), original);
+  assert.deepEqual(manager.loadLockfile().plugins, {});
+});
+
+test('a plugin exiting during a large stdin write rejects without crashing the host', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-plugin-exit-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'exit.js'), 'process.exit(0);');
+  const script = `
+    const { runPluginProcess } = require(${JSON.stringify(require.resolve('../lib/plugin-manager'))});
+    runPluginProcess({ pluginDirectory: ${JSON.stringify(root)}, manifest: { id: 'exit', entrypoint: 'exit.js' },
+      operation: 'scan', payload: { requestId: 'early-exit', payload: { rawEmail: 'a'.repeat(8 * 1024 * 1024) } }
+    }).then(() => { process.exitCode = 2; }, () => { process.stdout.write('safely rejected'); });
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 15000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, 'safely rejected');
 });

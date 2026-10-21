@@ -58,3 +58,26 @@ test('smtp relay rejects an invalid maximum message size', () => {
     upstreamProvider: 'sendgrid'
   }), /positive integer/);
 });
+
+test('a delivered relay message is not queued again when auditing fails', async () => {
+  const captured = captureServerOptions();
+  let deliveries = 0;
+  let queued = 0;
+  createSmtpRelayServer({
+    logSmtpRelay() {},
+    async sendViaUpstream() { deliveries++; return { status: 200 }; },
+    async addToQueue() { queued++; },
+    upstreamProvider: 'cloudflare',
+    policy: { tlsEnabled: false, assertSecureSession() {} },
+    auditStore: { async logEvent() { throw new Error('synthetic audit failure'); } },
+    smtpServerClass: captured.FakeSmtpServer
+  });
+  const stream = new PassThrough();
+  const result = new Promise(resolve => captured.options.onData(stream, {
+    id: 'audit-failure', envelope: { mailFrom: { address: 'sender@example.com' }, rcptTo: [{ address: 'dest@example.com' }] }
+  }, resolve));
+  stream.end('Subject: test\r\n\r\nbody');
+  assert.equal(await result, undefined);
+  assert.equal(deliveries, 1);
+  assert.equal(queued, 0);
+});

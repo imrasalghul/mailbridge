@@ -11,3 +11,19 @@ coverage
 .cache
 dist
 *.log
+
+# Runtime state and credentials must never enter a build context or image layer.
+data/
+secrets/
+plugins/
+wrangler.toml
+.dev.vars*
+.wrangler/
+.superpowers/
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.sqlite*
+*.db*
