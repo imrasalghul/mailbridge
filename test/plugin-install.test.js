@@ -63,6 +63,46 @@ test('transactional installs retain complete dependency layout and require expli
   assert.throws(() => manager.find('scanner'), /disabled/);
 });
 
+test('publication keeps the staging directory writable until its cross-parent rename', t => {
+  const { manager } = fixture(t);
+  const chmod = fs.chmodSync;
+  const rename = fs.renameSync;
+  const readonlyDirectories = new Set();
+  t.mock.method(fs, 'chmodSync', (location, mode) => {
+    if (fs.statSync(location).isDirectory() && !(mode & 0o200)) readonlyDirectories.add(location);
+    return chmod(location, mode);
+  });
+  t.mock.method(fs, 'renameSync', (source, target) => {
+    // POSIX requires a writable moved directory when changing its parent.
+    if (readonlyDirectories.has(source) && path.dirname(source) !== path.dirname(target)) {
+      throw Object.assign(new Error('cross-parent directory rename denied'), { code: 'EACCES' });
+    }
+    return rename(source, target);
+  });
+  const installed = manager.install('example-scanner@1.0.0', { npmRunner: fakeNpm(), enabled: true });
+  assert.equal(manager.find('scanner').manifest.version, '1.0.0');
+  assert.ok(readonlyDirectories.has(installed.releaseDirectory), 'published code must be readonly before activation');
+});
+
+test('permission failure after publication leaves the previous active release selected', t => {
+  const { root, manager } = fixture(t);
+  manager.install('example-scanner@1.0.0', { npmRunner: fakeNpm(), enabled: true });
+  const registryBefore = fs.readFileSync(manager.lockfilePath, 'utf8');
+  const chmod = fs.chmodSync;
+  let sawPublishedCandidate = false;
+  t.mock.method(fs, 'chmodSync', (location, mode) => {
+    if (path.dirname(location) === path.join(root, '.versions', 'scanner') && path.basename(location).startsWith('2.0.0-') && mode === 0o555) {
+      sawPublishedCandidate = fs.existsSync(path.join(location, 'node_modules', 'example-scanner', 'index.js'));
+      throw Object.assign(new Error('candidate permission update failed'), { code: 'EACCES' });
+    }
+    return chmod(location, mode);
+  });
+  assert.throws(() => manager.upgrade('example-scanner@2.0.0', { npmRunner: fakeNpm() }), /permission update failed/);
+  assert.equal(sawPublishedCandidate, true);
+  assert.equal(fs.readFileSync(manager.lockfilePath, 'utf8'), registryBefore);
+  assert.equal(manager.find('scanner').manifest.version, '1.0.0');
+});
+
 test('failed upgrade and invalid transitive locks leave the active version unchanged', t => {
   const { manager } = fixture(t);
   manager.install('example-scanner@1.0.0', { npmRunner: fakeNpm(), enabled: true });
