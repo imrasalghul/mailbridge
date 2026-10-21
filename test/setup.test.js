@@ -11,6 +11,21 @@ const { parse } = require('dotenv');
 const { createQueueCrypto } = require('../lib/queue-crypto');
 const { spawnSync } = require('node:child_process');
 
+function removePluginFixture(root) {
+  // Installed versions are deliberately read-only; restore fixture permissions
+  // before deleting them on POSIX, without following symbolic links.
+  const makeWritable = directory => {
+    fs.chmodSync(directory, 0o755);
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const location = path.join(directory, entry.name);
+      if (entry.isDirectory()) makeWritable(location);
+      else if (entry.isFile()) fs.chmodSync(location, 0o644);
+    }
+  };
+  makeWritable(root);
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
 function setupWithPluginFixture(t, { id, type }) {
   const pluginModule = require('../lib/plugin-manager');
   const makeManager = pluginModule.createPluginManager;
@@ -177,7 +192,7 @@ test('native setup keeps host plugin locations in its runtime configuration', as
 
 test('setup activates a selected scanner by its manifest ID after saving configuration', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-setup-activate-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removePluginFixture(root));
   const setup = setupWithPluginFixture(t, { id: 'reputation-scanner', type: 'scanner' });
   await answerSetup(root, { 'Enable Spamhaus plugin': 'yes', 'Exact npm package/version for Spamhaus': 'fixture-scanner@1.0.0' }, { setup });
   const registry = JSON.parse(fs.readFileSync(path.join(root, 'data', 'plugins.lock.json')));
@@ -189,7 +204,7 @@ test('setup activates a selected scanner by its manifest ID after saving configu
 test('setup rejects a package that does not declare the requested named provider', async t => {
   for (const manifest of [{ id: 'sendgrid', type: 'scanner' }, { id: 'different-provider', type: 'provider' }]) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-setup-provider-contract-'));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    t.after(() => removePluginFixture(root));
     const setup = setupWithPluginFixture(t, manifest);
     await assert.rejects(answerSetup(root, { 'Outbound provider': 'sendgrid', 'Exact npm package/version for Sendgrid': 'fixture-provider@1.0.0' }, { setup }), /requested sendgrid provider/);
     assert.equal(fs.existsSync(path.join(root, '.env')), false);
