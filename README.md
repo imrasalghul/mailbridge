@@ -43,7 +43,7 @@ trusted CIDR-restricted SMTP client
 
 Requirements:
 
-- Node.js 22.23.3 or newer (packaged runtime: 22.23.3)
+- Node.js 22.23.4 or newer (packaged runtime: 22.23.4)
 - Docker with Docker Compose
 - Cloudflare Email Routing, Workers, R2, and Queues
 - A private SMTP server

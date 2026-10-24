@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.3 — 2026-10-23
+
+### Security
+
+- Update the Node.js runtime to 22.23.4, which fixes Node2Shell (CVE-2026-111497) and other security issues in the October 21 Node.js security release.
+- Raise the supported runtime minimum to Node.js 22.23.4 and refresh the pinned Docker image, Debian package runtime, and CI runtime.
+
 ## 1.4.2 — 2026-10-21
 
 ### Security and reliability
