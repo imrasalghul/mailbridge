@@ -22,7 +22,7 @@
     "sqlite3": "6.0.1"
   },
   "devDependencies": {
-    "wrangler": "4.151.3"
+    "wrangler": "4.156.2"
   },
   "allowScripts": {
     "esbuild@0.28.2": true,
