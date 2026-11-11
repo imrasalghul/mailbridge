@@ -102,6 +102,9 @@ Compatibility concerns configuration and plugin interfaces. Both profiles keep t
 | `MAILBRIDGE_LOG_FORMAT` | `text`, preserving prefixes with escaped control characters | `json` |
 | `MAILBRIDGE_STRICT_FILE_READS` | `false`: preserve operator-configured file links during setup | `true`: reject linked setup configuration/key files |
 | `MAILBRIDGE_DEAD_LETTER_QUEUE` | Setup retains an existing binding without requiring a new queue | Setup creates/configures a dead-letter queue |
+| `MAILBRIDGE_KEEP_FAILED` (backend and Worker) | `false`: the Worker deletes rejected mail; the local queue drops items at `QUEUE_MAX_ATTEMPTS` or on a permanent failure | `true`: rejected mail is kept under `failed/` in R2; queue items are parked instead of dropped |
+| `MAILBRIDGE_RAW_ENCODING` (Worker) | `text`: the message is decoded as UTF-8, as earlier backends expect | `base64`: the message's exact bytes, so 8-bit mail in any charset and its DKIM signature survive |
+| `MAILBRIDGE_SWEEP` (Worker) | Not set: no scheduled re-send | Setup sets it with a 30-minute cron trigger when delivery receipts are on |
 
 Each setting can override the profile in `.env` (or `/etc/mailbridge/mailbridge.env` on Debian). Before enabling strict plugins, reinstall or upgrade each plugin to produce the full dependency lock and integrity inventory, configure namespaced secrets, and run its health check. Disable unused plugins explicitly. Legacy rollback snapshots without a full dependency lock remain usable in legacy mode.
 
@@ -196,7 +199,26 @@ Read the complete [Security Model](https://github.com/imrasalghul/mailbridge/wik
 
 The Worker supplies a stable delivery identity for each R2 object. With MAILBRIDGE_DELIVERY_RECEIPTS=true (the modern default), Mailbridge stores completed outcomes in `DATA_DIR/delivery-receipts.db`; repeated or concurrent handoffs reuse those outcomes. This prevents another SMTP delivery when the original HTTP response or R2 cleanup fails. Back up this database along with the queue and its keys, and retain it while an R2 object or queue reference might still be replayed. Receipts contain identifiers, hashes, and generic outcomes, not raw mail. SMTP itself cannot guarantee exactly-once delivery if the process crashes after the remote server accepts mail but before the receipt is saved, or if the SMTP acknowledgement is lost.
 
-SMTP 4xx failures enter the encrypted local retry queue; SMTP 5xx rejections return HTTP 422. The Worker deletes rejected mail only for explicit HTTP 400, 406, 413, or 422 responses. Authentication, configuration, timeout, throttling, and server failures retry without deleting R2 ciphertext.
+SMTP 4xx failures enter the encrypted local retry queue; SMTP 5xx rejections return HTTP 422. Only explicit HTTP 400, 406, 413, or 422 responses count as rejections. Authentication, configuration, timeout, throttling, and server failures retry without touching R2 ciphertext.
+
+Cloudflare has already accepted every message, so a sender never gets a bounce for mail Mailbridge can't deliver. With `MAILBRIDGE_KEEP_FAILED=true` (the modern default), nothing undeliverable is deleted automatically:
+
+- **Worker:** a rejected message moves from `inbound/` to `failed/` in R2, still encrypted, with `failedStatus` and `failedAt` metadata. Replay it with the recovery endpoint below once the cause is fixed, or delete it yourself. A replayed message that is rejected again stays in `failed/`. Without the setting, rejected mail is deleted as before.
+- **Local queue:** an item that reaches `QUEUE_MAX_ATTEMPTS` is parked instead of dropped and retried every `QUEUE_PARKED_RETRY_MINUTES` (default 60), after newer mail. An item that gets a permanent SMTP failure is parked without automatic retries. Parked items stay encrypted on disk; `npm run queue -- list` shows them (metadata only), `npm run queue -- retry ID` (or `--all`) puts them back in the queue with a fresh attempt count, and `npm run queue -- delete ID --yes` removes one. In the container: `docker exec mail-bridge npm run queue -- list`; on Debian, add `--system`.
+
+### Re-sending after a long outage
+
+Cloudflare Queues retries a failed handoff three times (about 8 minutes) before moving it to the dead-letter queue. The encrypted object stays in R2, but nothing sends it again by itself. With `MAILBRIDGE_SWEEP = "true"` and a cron trigger, the Worker re-queues every `inbound/` object older than `MAILBRIDGE_SWEEP_MIN_AGE_MINUTES` (default 60, so the queue's own retries are over), at most `MAILBRIDGE_SWEEP_MAX_MESSAGES` (default 1000) per run. It first checks `GET /health` on the `NODE_APP_URL` host and does nothing while the backend is down, so no queue operations are spent then (Workers Free allows 10,000 a day). Objects under `failed/` are never re-sent automatically.
+
+```toml
+[vars]
+MAILBRIDGE_SWEEP = "true"
+
+[triggers]
+crons = ["*/30 * * * *"]
+```
+
+The sweep relies on delivery receipts (`MAILBRIDGE_DELIVERY_RECEIPTS=true` on the backend): re-sending a message Mailbridge already has then does nothing. `GET /health` must be reachable on the `NODE_APP_URL` host. Fresh modern setup adds both settings when receipts are on.
 
 Fresh modern setup creates `mailbridge-inbound-dead-letter` before deployment. Existing installations can opt in with `MAILBRIDGE_DEAD_LETTER_QUEUE=true` when rerunning setup, or create the queue manually and add `dead_letter_queue = "mailbridge-inbound-dead-letter"` to their queue consumer, using the actual queue name if customized. Monitor this queue: [Cloudflare moves exhausted messages to the dead-letter queue](https://developers.cloudflare.com/queues/configuration/dead-letter-queues/), whose retention is finite. The encrypted R2 object remains available for recovery even after its queue reference expires, unless a bucket lifecycle rule removes it.
 
@@ -207,7 +229,7 @@ node --env-file=.env --input-type=module <<'NODE'
 const response = await fetch('https://mailbridge-worker.example.workers.dev/api/replay/email', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json', 'X-Webhook-Secret': process.env.WEBHOOK_SECRET },
-  body: JSON.stringify({ objectKey: 'inbound/2026-10-21/replace-with-object-uuid.bin' })
+  body: JSON.stringify({ objectKey: 'inbound/2026-10-21/replace-with-object-uuid.bin' })   // or failed/…
 });
 console.log(response.status);
 if (response.status !== 202) process.exitCode = 1;

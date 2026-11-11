@@ -7,6 +7,15 @@ preview_urls = false
 MAILBRIDGE_BEHAVIOR_PROFILE = "modern"
 NODE_APP_URL = "https://mailbridge.example.com/api/webhook/email"
 MAIL_STORE_ENCRYPTION_VERSION = "v1"
+# Re-queue stored mail after an outage longer than the queue's retries (needs the cron trigger
+# below, and delivery receipts on the backend). The modern profile also keeps permanently
+# rejected mail under failed/ (MAILBRIDGE_KEEP_FAILED) and stores each message's exact bytes
+# (MAILBRIDGE_RAW_ENCODING = "base64").
+MAILBRIDGE_SWEEP = "true"
+MAILBRIDGE_SWEEP_MIN_AGE_MINUTES = "60"
+
+[triggers]
+crons = ["*/30 * * * *"]
 
 [[r2_buckets]]
 binding = "MAIL_STORE"

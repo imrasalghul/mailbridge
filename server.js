@@ -31,6 +31,7 @@ const {
   buildInboundHeaders
 } = require('./lib/spam-pipeline');
 const { buildSmtpRelayPolicy } = require('./lib/smtp-relay-policy');
+const { rawToText } = require('./lib/raw-message');
 const { createSmtpRelayServer } = require('./lib/smtp-relay-server');
 
 function parseBoolean(value, defaultValue) {
@@ -42,6 +43,10 @@ const port = Number.parseInt(process.env.PORT || '3090', 10);
 const smtpRelayPort = Number.parseInt(process.env.SMTP_RELAY_PORT || '2525', 10);
 const smtpRelayMaxMessageBytes = Number.parseInt(process.env.SMTP_RELAY_MAX_MESSAGE_BYTES || String(50 * 1024 * 1024), 10);
 const maxQueueAttempts = Number.parseInt(process.env.QUEUE_MAX_ATTEMPTS || '20', 10);
+const queueParkedRetryMinutes = Number.parseInt(process.env.QUEUE_PARKED_RETRY_MINUTES || '60', 10);
+if (!Number.isSafeInteger(queueParkedRetryMinutes) || queueParkedRetryMinutes < 1) {
+  throw new Error('Invalid QUEUE_PARKED_RETRY_MINUTES; use a whole number of minutes, 1 or more');
+}
 const compatibility = getCompatibility();
 const logLine = message => formatLog(message, compatibility.logFormat);
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
@@ -114,7 +119,9 @@ async function invokeCapability(type, capability, operation, payload) {
 }
 
 async function applyMiddlewarePlugins({ requestId, from, to, rawEmail, sourceIp }) {
-  let current = { from, to, rawEmail };
+  // Plugins get text; the exact bytes are kept unless a plugin changes the message.
+  const originalText = Buffer.isBuffer(rawEmail) ? rawEmail.toString('utf8') : null;
+  let current = { from, to, rawEmail: originalText ?? rawEmail };
   const middleware = pluginManager.discover({ type: 'middleware' })
     .filter(({ manifest }) => manifest.type === 'middleware')
     .sort((a, b) => a.manifest.priority - b.manifest.priority || a.manifest.id.localeCompare(b.manifest.id));
@@ -135,6 +142,7 @@ async function applyMiddlewarePlugins({ requestId, from, to, rawEmail, sourceIp 
       console.warn(logLine(`[${requestId}] Middleware ${manifest.id} failed open: ${error.message}`));
     }
   }
+  if (originalText !== null && current.rawEmail === originalText) current.rawEmail = rawEmail;
   return { rejected: false, ...current };
 }
 
@@ -232,7 +240,7 @@ async function start() {
     log: logVerbose
   });
   const classifyWithPlugins = async (rawEmail, requestId) => {
-    const results = await invokeCapability('scanner', 'classification', 'scan', { rawEmail, requestId });
+    const results = await invokeCapability('scanner', 'classification', 'scan', { rawEmail: rawToText(rawEmail), requestId });
     const match = results.find(({ result }) => result.spam === '1' || result.spam === '0');
     return match ? { ...match.result, pluginId: match.plugin.id, pluginVersion: match.plugin.version } : null;
   };
@@ -242,6 +250,8 @@ async function start() {
     store: queueStore,
     auditStore,
     maxQueueAttempts,
+    keepFailed: compatibility.keepFailed,
+    parkedRetryIntervalMs: queueParkedRetryMinutes * 60 * 1000,
     async deliverQueuedMessage(row) {
       if (row.target && row.target !== 'local_mail') {
         const providerLabel = String(row.target);
@@ -340,7 +350,7 @@ async function start() {
     const gtubeDetected = containsGtube(raw);
 
     try {
-      const reputationResults = await invokeCapability('scanner', 'reputation', 'scan', { senderIp: sourceIp, envelopeFrom: from, rawEmail: raw, requestId });
+      const reputationResults = await invokeCapability('scanner', 'reputation', 'scan', { senderIp: sourceIp, envelopeFrom: from, rawEmail: rawToText(raw), requestId });
       const reputationMatch = reputationResults.find(({ result }) => result.blocked);
       const reputationCheck = reputationMatch ? { ...reputationMatch.result, pluginId: reputationMatch.plugin.id, pluginVersion: reputationMatch.plugin.version } : {};
       const senderDomain = reputationCheck.senderDomain || extractDomainFromAddress(from);

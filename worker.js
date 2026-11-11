@@ -1,5 +1,12 @@
 let cachedPublicKeyPromise = null;
 const DEFAULT_BRIDGE_WEBHOOK_PATH = "/api/webhook/email";
+const INBOUND_PREFIX = "inbound/";
+const FAILED_PREFIX = "failed/";
+const STORED_OBJECT_KEY = /^(inbound|failed)\/\d{4}-\d{2}-\d{2}\/[a-zA-Z0-9-]+\.bin$/;
+const PERMANENT_BRIDGE_STATUSES = [400, 406, 413, 422];
+const DEFAULT_SWEEP_MIN_AGE_MINUTES = 60;
+const DEFAULT_SWEEP_MAX_MESSAGES = 1000;
+const QUEUE_SEND_BATCH_LIMIT = 100;
 
 export default {
   async fetch(request, env, ctx) {
@@ -10,6 +17,16 @@ export default {
     }
 
     return handleSendEmailRequest(request, env);
+  },
+
+  // Cron trigger: re-queue stored mail the queue's own retries gave up on (backend outage longer
+  // than the retry window). Opt-in with MAILBRIDGE_SWEEP; relies on delivery receipts so a message
+  // the backend already has is not delivered twice.
+  async scheduled(controller, env, ctx) {
+    if (!booleanSetting(env, "MAILBRIDGE_SWEEP", false)) return;
+    ctx.waitUntil(sweepStoredMessages(env).catch((err) => {
+      console.error("sweep failed", { message: err?.message || String(err) });
+    }));
   },
 
   async email(message, env, ctx) {
@@ -30,7 +47,7 @@ export default {
         encryptionVersion,
       });
 
-      const rawText = await new Response(message.raw).text();
+      const rawField = await readRawMessage(message, getRawEncoding(env));
       const encryptedPayload = await encryptEnvelope({
         env,
         payload: {
@@ -38,7 +55,7 @@ export default {
           from: message.from || "",
           to: message.to || "",
           senderIp,
-          raw: rawText,
+          ...rawField,
           receivedAt,
         },
         version: encryptionVersion,
@@ -116,7 +133,7 @@ export default {
           continue;
         }
 
-        if (![400, 406, 413, 422].includes(response.status)) {
+        if (!PERMANENT_BRIDGE_STATUSES.includes(response.status)) {
           console.error("temporary bridge failure", {
             objectKey,
             status: response.status,
@@ -129,12 +146,16 @@ export default {
           objectKey,
           status: response.status,
         });
-        await deleteStoredMessageOrRetry({
-          env,
-          msg,
-          objectKey,
-          reason: "permanent bridge failure",
-        });
+        if (keepFailedMail(env)) {
+          await keepFailedMessageOrRetry({ env, msg, objectKey, status: response.status });
+        } else {
+          await deleteStoredMessageOrRetry({
+            env,
+            msg,
+            objectKey,
+            reason: "permanent bridge failure",
+          });
+        }
       } catch (err) {
         console.error("queue() failed", {
           objectKey,
@@ -213,7 +234,7 @@ async function handleReplayRequest(request, env) {
   let payload;
   try { payload = await request.json(); }
   catch { return jsonResponse({ error: "Invalid JSON" }, 400); }
-  if (typeof payload?.objectKey !== "string" || !/^inbound\/\d{4}-\d{2}-\d{2}\/[a-zA-Z0-9-]+\.bin$/.test(payload.objectKey)) {
+  if (typeof payload?.objectKey !== "string" || !STORED_OBJECT_KEY.test(payload.objectKey)) {
     return jsonResponse({ error: "Invalid object key" }, 400);
   }
   try {
@@ -250,8 +271,7 @@ function buildBridgeEndpointUrl(value) {
 }
 
 function buildBridgeTransportOptions(env) {
-  const profile = String(env.MAILBRIDGE_BEHAVIOR_PROFILE || "legacy").trim().toLowerCase();
-  if (!["legacy", "modern"].includes(profile)) throw new Error("Invalid MAILBRIDGE_BEHAVIOR_PROFILE");
+  const profile = getProfile(env);
   let allowRedirects = profile === "legacy";
   const redirectSetting = String(env.MAILBRIDGE_HTTP_ALLOW_REDIRECTS ?? "").trim().toLowerCase();
   if (redirectSetting) {
@@ -346,6 +366,122 @@ async function deleteStoredMessageOrRetry({ env, msg, objectKey, reason }) {
   }
 }
 
+// Cloudflare already accepted the message, so the sender never gets a bounce: keep it under
+// failed/ for the operator (replay with /api/replay/email, or delete by hand) instead of deleting it.
+async function keepFailedMessageOrRetry({ env, msg, objectKey, status }) {
+  try {
+    const object = await env.MAIL_STORE.get(objectKey);
+    if (object) {
+      const failedKey = toFailedKey(objectKey);
+      await env.MAIL_STORE.put(failedKey, await object.arrayBuffer(), {
+        httpMetadata: object.httpMetadata,
+        customMetadata: {
+          ...object.customMetadata,
+          failedStatus: String(status),
+          failedAt: new Date().toISOString(),
+        },
+      });
+      // A replayed failed/ object is rewritten in place: deleting it would lose the message.
+      if (failedKey !== objectKey) await env.MAIL_STORE.delete(objectKey);
+      console.log("kept failed object", { objectKey, failedKey, status });
+    }
+    msg.ack();
+  } catch (err) {
+    console.error("failed to keep failed object", {
+      objectKey,
+      message: err?.message || String(err),
+      stack: err?.stack || null,
+    });
+    msg.retry({ delaySeconds: getRetryDelaySeconds(msg.attempts) });
+  }
+}
+
+function toFailedKey(objectKey) {
+  return objectKey.startsWith(INBOUND_PREFIX) ? FAILED_PREFIX + objectKey.slice(INBOUND_PREFIX.length) : objectKey;
+}
+
+async function sweepStoredMessages(env) {
+  if (!(await backendIsHealthy(env))) {
+    console.log("sweep skipped: backend not healthy");
+    return { requeued: 0 };
+  }
+  const minAgeMinutes = numberSetting(env, "MAILBRIDGE_SWEEP_MIN_AGE_MINUTES", DEFAULT_SWEEP_MIN_AGE_MINUTES);
+  const maxMessages = numberSetting(env, "MAILBRIDGE_SWEEP_MAX_MESSAGES", DEFAULT_SWEEP_MAX_MESSAGES);
+  const cutoff = Date.now() - minAgeMinutes * 60_000;
+  let cursor;
+  let requeued = 0;
+  do {
+    const page = await env.MAIL_STORE.list({ prefix: INBOUND_PREFIX, cursor, limit: 1000, include: ["customMetadata"] });
+    const due = page.objects
+      .filter((o) => o.uploaded.getTime() < cutoff && o.customMetadata?.encryptionVersion === "v1")
+      .slice(0, maxMessages - requeued);
+    for (let i = 0; i < due.length; i += QUEUE_SEND_BATCH_LIMIT) {
+      await env.MAIL_QUEUE.sendBatch(due.slice(i, i + QUEUE_SEND_BATCH_LIMIT).map((o) => ({
+        body: { objectKey: o.key, encryptionVersion: "v1" },
+      })));
+    }
+    requeued += due.length;
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor && requeued < maxMessages);
+  if (requeued) console.log("sweep re-queued stored messages", { requeued });
+  return { requeued };
+}
+
+// No queue operations are spent while the backend is down; the next run tries again.
+async function backendIsHealthy(env) {
+  try {
+    const { redirect } = buildBridgeTransportOptions(env);
+    const response = await fetch(new URL("/health", buildBridgeEndpointUrl(env.NODE_APP_URL)), {
+      redirect,
+      signal: AbortSignal.timeout(10_000),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+// "base64" keeps the message's exact bytes (8-bit mail in any charset, DKIM signatures intact).
+// "text" is the earlier format: the message decoded as UTF-8, which older backends expect.
+function getRawEncoding(env) {
+  const value = String(env.MAILBRIDGE_RAW_ENCODING ?? "").trim().toLowerCase();
+  if (value) {
+    if (!["base64", "text"].includes(value)) throw new Error("Invalid MAILBRIDGE_RAW_ENCODING; use base64 or text");
+    return value;
+  }
+  return getProfile(env) === "modern" ? "base64" : "text";
+}
+
+async function readRawMessage(message, encoding) {
+  if (encoding === "text") return { raw: await new Response(message.raw).text() };
+  return { rawBase64: bytesToBase64(new Uint8Array(await new Response(message.raw).arrayBuffer())) };
+}
+
+function keepFailedMail(env) {
+  return booleanSetting(env, "MAILBRIDGE_KEEP_FAILED", getProfile(env) === "modern");
+}
+
+function getProfile(env) {
+  const profile = String(env.MAILBRIDGE_BEHAVIOR_PROFILE || "legacy").trim().toLowerCase();
+  if (!["legacy", "modern"].includes(profile)) throw new Error("Invalid MAILBRIDGE_BEHAVIOR_PROFILE");
+  return profile;
+}
+
+function booleanSetting(env, name, fallback) {
+  const value = String(env[name] ?? "").trim().toLowerCase();
+  if (!value) return fallback;
+  if (["true", "1", "yes", "on"].includes(value)) return true;
+  if (["false", "0", "no", "off"].includes(value)) return false;
+  throw new Error(`Invalid ${name}`);
+}
+
+function numberSetting(env, name, fallback) {
+  const value = String(env[name] ?? "").trim();
+  if (!value) return fallback;
+  if (!/^\d+$/.test(value) || Number(value) < 1 || !Number.isSafeInteger(Number(value))) throw new Error(`Invalid ${name}`);
+  return Number(value);
+}
+
 function makeObjectKey({ receivedAt, id }) {
   const date = receivedAt.slice(0, 10);
   return `inbound/${date}/${id}.bin`;
@@ -370,10 +506,17 @@ function pemToArrayBuffer(pem) {
 }
 
 function arrayBufferToBase64(value) {
-  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+  return bytesToBase64(value instanceof Uint8Array ? value : new Uint8Array(value));
+}
+
+// Native when the runtime has it; otherwise 32 KiB chunks instead of one string append per byte,
+// so messages of several MB stay within the Worker's CPU budget.
+function bytesToBase64(bytes) {
+  if (typeof bytes.toBase64 === "function") return bytes.toBase64();
+  const chunkSize = 0x8000;
   let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
   }
   return btoa(binary);
 }
@@ -388,5 +531,7 @@ function getRetryDelaySeconds(attempts) {
 
 export {
   buildBridgeEndpointUrl,
+  bytesToBase64,
   DEFAULT_BRIDGE_WEBHOOK_PATH,
+  sweepStoredMessages,
 };

@@ -9,6 +9,7 @@
   "scripts": {
     "setup": "node scripts/setup.js",
     "plugins": "node scripts/plugins.js",
+    "queue": "node scripts/queue.js",
     "start": "node server.js",
     "test": "node --test"
   },
