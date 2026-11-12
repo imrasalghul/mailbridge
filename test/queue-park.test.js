@@ -88,7 +88,10 @@ test('permanent failures are parked for the operator and never retried automatic
   const h = await harness(t, { deliver: permanent });
   await h.store.addToQueue('a@example.com', 'b@example.org', 'Subject: x\r\n\r\nbody');
   await h.manager.processQueue();
-  assert.deepEqual((await h.rows()).map(r => r.park_reason), ['permanent_failure']);
+  assert.deepEqual((await h.rows()).map(r => [r.attempts, r.park_reason]), [[1, 'permanent_failure']]);
+  const numbers = await all(h.auditStore.db, `SELECT event_type, attempt_number FROM audit_events
+    WHERE event_type IN ('delivery_failed', 'parked') ORDER BY id`);
+  assert.deepEqual(numbers.map(e => [e.event_type, e.attempt_number]), [['delivery_failed', 1], ['parked', 1]]);
   for (let i = 0; i < 3; i++) {
     h.advance(24 * HOUR);
     await h.manager.processQueue();

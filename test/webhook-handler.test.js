@@ -98,3 +98,29 @@ test('webhook defaults to independent deliveries when compatibility settings are
   assert.equal((await post(body)).status, 200);
   assert.equal(calls, 2);
 });
+
+test('replaying a kept failed/ object processes it again after a rejection', async t => {
+  const encrypted = { encryptedPayload: { version: 'v1', algorithm: 'RSA-OAEP-256+A256GCM', wrappedKey: 'k', iv: 'i', ciphertext: 'c' } };
+  const outcomes = [{ statusCode: 422, body: 'Permanently rejected by local mail server' }, { statusCode: 200, body: 'OK' }];
+  let calls = 0;
+  const post = await harness(t, async () => outcomes[Math.min(calls++, outcomes.length - 1)]);
+  assert.equal((await post(encrypted, 'test-secret', 'inbound/2026-11-09/m.bin')).status, 422);
+  // The same ciphertext retried under its inbound/ identity keeps the stored rejection.
+  assert.equal((await post(encrypted, 'test-secret', 'inbound/2026-11-09/m.bin')).status, 422);
+  assert.equal(calls, 1);
+  // Replayed from failed/ after the operator fixed the cause: processed again and delivered.
+  assert.equal((await post(encrypted, 'test-secret', 'failed/2026-11-09/m.bin')).status, 200);
+  assert.equal(calls, 2);
+  // A second replay doesn't deliver twice.
+  assert.equal((await post(encrypted, 'test-secret', 'failed/2026-11-09/m.bin')).status, 200);
+  assert.equal(calls, 2);
+});
+
+test('a failed/ replay never forgets a completed delivery', async t => {
+  const encrypted = { encryptedPayload: { version: 'v1', algorithm: 'RSA-OAEP-256+A256GCM', wrappedKey: 'k', iv: 'i', ciphertext: 'd' } };
+  let calls = 0;
+  const post = await harness(t, async () => { calls++; return { statusCode: 200, body: 'OK' }; });
+  assert.equal((await post(encrypted, 'test-secret', 'inbound/2026-11-09/n.bin')).status, 200);
+  assert.equal((await post(encrypted, 'test-secret', 'failed/2026-11-09/n.bin')).status, 200);
+  assert.equal(calls, 1);
+});

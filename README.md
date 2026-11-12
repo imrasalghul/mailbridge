@@ -108,7 +108,7 @@ Compatibility concerns configuration and plugin interfaces. Both profiles keep t
 
 Each setting can override the profile in `.env` (or `/etc/mailbridge/mailbridge.env` on Debian). Before enabling strict plugins, reinstall or upgrade each plugin to produce the full dependency lock and integrity inventory, configure namespaced secrets, and run its health check. Disable unused plugins explicitly. Legacy rollback snapshots without a full dependency lock remain usable in legacy mode.
 
-Restart Mailbridge after environment changes. Worker settings are separate: setup copies the profile and HTTP overrides into `wrangler.toml`. For manual deployments, set those variables in the Worker's `[vars]` block or dashboard. Editing only the backend `.env` does not change an already-deployed Worker. Setup preserves existing Worker compatibility dates.
+Restart Mailbridge after environment changes. Worker settings are separate: setup copies the profile, HTTP, recovery and raw-encoding overrides into `wrangler.toml`. For manual deployments, set those variables in the Worker's `[vars]` block or dashboard. Editing only the backend `.env` does not change an already-deployed Worker. Setup preserves existing Worker compatibility dates.
 
 ## Managing plugins
 
@@ -229,7 +229,7 @@ node --env-file=.env --input-type=module <<'NODE'
 const response = await fetch('https://mailbridge-worker.example.workers.dev/api/replay/email', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json', 'X-Webhook-Secret': process.env.WEBHOOK_SECRET },
-  body: JSON.stringify({ objectKey: 'inbound/2026-10-21/replace-with-object-uuid.bin' })   // or failed/…
+  body: JSON.stringify({ objectKey: 'inbound/2026-10-21/replace-with-object-uuid.bin' })   // or failed/...
 });
 console.log(response.status);
 if (response.status !== 202) process.exitCode = 1;

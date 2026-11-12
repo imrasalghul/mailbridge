@@ -5,7 +5,7 @@
 ### Delivery recovery
 
 - Re-send stored mail after outages longer than the queue's retries: with `MAILBRIDGE_SWEEP` and a cron trigger, the Worker re-queues `inbound/` objects older than `MAILBRIDGE_SWEEP_MIN_AGE_MINUTES` once `GET /health` answers on the backend host. Fresh modern setup adds the setting and a 30-minute trigger when delivery receipts are on.
-- Keep undeliverable mail instead of deleting it (`MAILBRIDGE_KEEP_FAILED`, modern default). The Worker moves rejected objects to `failed/` in R2 and the recovery endpoint accepts `failed/` keys. The local queue parks items at `QUEUE_MAX_ATTEMPTS` and retries them every `QUEUE_PARKED_RETRY_MINUTES`; permanent failures are parked without automatic retries. New `npm run queue` lists, retries and deletes queue items using metadata only.
+- Keep undeliverable mail instead of deleting it (`MAILBRIDGE_KEEP_FAILED`, modern default). The Worker moves rejected objects to `failed/` in R2 and the recovery endpoint accepts `failed/` keys. The local queue parks items at `QUEUE_MAX_ATTEMPTS` and retries them every `QUEUE_PARKED_RETRY_MINUTES`; permanent failures are parked without automatic retries. New `npm run queue` lists, retries and deletes queue items using metadata only. Replaying a `failed/` object forgets its earlier rejection receipt (never a completed delivery), so it is processed again.
 
 ### Message fidelity
 
