@@ -171,3 +171,31 @@ test('npm run queue lists, retries and deletes queue items', async t => {
     assert.throws(() => queueCli.parseArgs(argv), /Usage/);
   }
 });
+
+test('npm run queue reads a linked .env in the legacy profile and refuses it in the modern one', async t => {
+  const h = await harness(t, { deliver: permanent });
+  const parked = await h.store.addToQueue('a@example.com', 'b@example.org', 'Subject: x\r\n\r\nbody');
+  await h.manager.processQueue();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbridge-park-link-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cwd = path.join(root, 'app');
+  fs.mkdirSync(cwd);
+  const target = path.join(root, 'mailbridge.env');
+  try { fs.symlinkSync(target, path.join(cwd, '.env'), 'file'); }
+  catch (error) {
+    if (error.code === 'EPERM') return t.skip('Host does not permit creating symbolic links');
+    throw error;
+  }
+  const settings = `DATA_DIR=${h.dataDir}\nSECRETS_DB_PATH=${h.secretsDbPath}\n`;
+  const list = async env => {
+    let text = '';
+    await queueCli.run(['list'], { cwd, env, output: { write: chunk => { text += chunk; } } });
+    return text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line).id);
+  };
+
+  fs.writeFileSync(target, settings);
+  assert.deepEqual(await list({}), [parked]);
+  await assert.rejects(list({ MAILBRIDGE_BEHAVIOR_PROFILE: 'modern' }), /symbolic link|ELOOP/);
+  fs.writeFileSync(target, `${settings}MAILBRIDGE_BEHAVIOR_PROFILE=modern\n`);   // modern set in the file itself
+  await assert.rejects(list({}), /symbolic link|ELOOP/);
+});

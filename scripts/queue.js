@@ -9,6 +9,7 @@ const path = require('node:path');
 const { parse } = require('dotenv');
 const sqlite3 = require('sqlite3').verbose();
 const { readOptionalFile } = require('../lib/atomic-files');
+const { getCompatibility } = require('../lib/compatibility');
 const { createQueueStore } = require('../lib/queue-store');
 const { close, run: runSql } = require('../lib/sqlite-helpers');
 
@@ -27,8 +28,10 @@ function parseArgs(argv) {
 
 function resolvePaths({ system, cwd, env }) {
   const envPath = system ? '/etc/mailbridge/mailbridge.env' : path.join(cwd, '.env');
-  const contents = readOptionalFile(envPath, 'utf8');
+  // Read through operator-owned links only in the compatibility profile, as scripts/plugins.js does.
+  const contents = readOptionalFile(envPath, 'utf8', { allowSymlinks: !getCompatibility(env).strictFileReads });
   const activeEnv = { ...(contents === undefined ? {} : parse(contents)), ...env };
+  if (getCompatibility(activeEnv).strictFileReads && contents !== undefined) readOptionalFile(envPath);
   return {
     dataDir: path.resolve(activeEnv.DATA_DIR || path.join(APP_DIR, 'data')),
     secretsDbPath: path.resolve(activeEnv.SECRETS_DB_PATH || path.join(APP_DIR, 'secrets', 'secrets.db'))
