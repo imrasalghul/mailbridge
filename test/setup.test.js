@@ -126,6 +126,7 @@ test('legacy setup preserves its Worker date and does not require a new dead-let
   assert.match(result.wranglerText, /MAILBRIDGE_HTTP_ALLOW_REDIRECTS = "false"/);
   assert.match(result.wranglerText, /MAILBRIDGE_HTTP_TIMEOUT_MS = "45000"/);
   assert.doesNotMatch(result.wranglerText, /dead_letter_queue/);
+  assert.doesNotMatch(result.wranglerText, /MAILBRIDGE_SWEEP|\[triggers\]/);
   assert.doesNotMatch(transcript, /queues create .*dead-letter/);
   fs.appendFileSync(path.join(root, '.env'), '\nMAILBRIDGE_DEAD_LETTER_QUEUE=true\n');
   const optedIn = await answerSetup(root);
@@ -402,6 +403,8 @@ test('setup manual deployment creates the dead-letter queue with pinned Wrangler
   const { result, transcript } = await answerSetup(root, { 'Cloudflare Queue name': 'incoming-mail' });
   assert.match(result.wranglerText, /compatibility_date = "2026-10-21"/);
   assert.match(result.wranglerText, /\[\[queues.consumers\]\][\s\S]*dead_letter_queue = "incoming-mail-dead-letter"/);
+  assert.match(result.wranglerText, /MAILBRIDGE_SWEEP = "true"/);
+  assert.match(result.wranglerText, /\[triggers\]\ncrons = \["\*\/30 \* \* \* \*"\]/);
   assert.match(result.wranglerText, /max_retries = 3/);
   assert.match(transcript, /npx --yes wrangler@4\.151\.3 queues create incoming-mail-dead-letter/);
   assert.ok(transcript.indexOf('queues create incoming-mail-dead-letter') < transcript.indexOf('wrangler@4.151.3 deploy'));

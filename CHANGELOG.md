@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Delivery recovery
+
+- Re-send stored mail after outages longer than the queue's retries: with `MAILBRIDGE_SWEEP` and a cron trigger, the Worker re-queues `inbound/` objects older than `MAILBRIDGE_SWEEP_MIN_AGE_MINUTES` once `GET /health` answers on the backend host. Fresh modern setup adds the setting and a 30-minute trigger when delivery receipts are on.
+- Keep undeliverable mail instead of deleting it (`MAILBRIDGE_KEEP_FAILED`, modern default). The Worker moves rejected objects to `failed/` in R2 and the recovery endpoint accepts `failed/` keys. The local queue parks items at `QUEUE_MAX_ATTEMPTS` and retries them every `QUEUE_PARKED_RETRY_MINUTES`; permanent failures are parked without automatic retries. New `npm run queue` lists, retries and deletes queue items using metadata only, and reads a linked `.env` only where `npm run plugins` does (`MAILBRIDGE_STRICT_FILE_READS=false`). Replaying a `failed/` object forgets its earlier rejection receipt (never a completed delivery), so it is processed again.
+
+### Message fidelity
+
+- Keep each message's exact bytes (`MAILBRIDGE_RAW_ENCODING=base64`, modern default). 8-bit mail in charsets other than UTF-8 no longer loses characters or breaks its DKIM signature. The backend accepts both payload formats, adds its headers by editing only the header block, and sends SpamAssassin the original bytes.
+- Encode Worker payloads in 32 KiB chunks (or natively where available) instead of one character at a time, so messages of several MB stay within the Worker's CPU budget.
+
+### Upgrade notes
+
+Deploy the backend before the Worker: a backend from an earlier release can't read `rawBase64` payloads. The queue database gains two columns (`parked_at`, `park_reason`) on start. Legacy environments keep the earlier behavior unless the settings above are set explicitly.
+
 ## 1.4.3 — 2026-10-23
 
 ### Security

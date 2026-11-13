@@ -179,6 +179,8 @@ function generateArtifacts(config, generated = {}) {
   const compatibility = getCompatibility({ ...config.existingEnvironment, MAILBRIDGE_BEHAVIOR_PROFILE: config.behaviorProfile || config.existingEnvironment?.MAILBRIDGE_BEHAVIOR_PROFILE || (config.existingEnvironment ? 'legacy' : 'modern') });
   const deadLetterQueueEnabled = config.deadLetterQueueEnabled ?? booleanSetting(config.existingEnvironment || {}, 'MAILBRIDGE_DEAD_LETTER_QUEUE', compatibility.modern);
   const deadLetterQueueName = deadLetterQueueEnabled ? config.deadLetterQueueName || `${config.queueName}-dead-letter` : undefined;
+  // The Worker's re-send sweep relies on delivery receipts, so fresh setup turns it on with them.
+  const sweepEnabled = config.sweepEnabled ?? booleanSetting(config.existingEnvironment || {}, 'MAILBRIDGE_SWEEP', compatibility.modern && compatibility.receipts);
   const queueMasterKey = generated.queueMasterKey || crypto.randomBytes(32).toString('base64');
   const webhookSecret = generated.webhookSecret || crypto.randomBytes(48).toString('base64');
   const cloudflareSendSecret = generated.cloudflareSendSecret || crypto.randomBytes(48).toString('base64');
@@ -271,10 +273,13 @@ function generateArtifacts(config, generated = {}) {
   } else {
     envText = sections.map(([label, keys]) => `# ${label}\n${keys.map((key) => `${key}=${envValue(env[key])}`).join('\n')}`).join('\n\n') + '\n';
   }
-  const workerSettings = ['MAILBRIDGE_BEHAVIOR_PROFILE', 'MAILBRIDGE_HTTP_ALLOW_REDIRECTS', 'MAILBRIDGE_HTTP_TIMEOUT_MS']
-    .filter(name => env[name] !== undefined).map(name => `${name} = ${tomlValue(env[name])}\n`).join('');
+  const workerSettings = ['MAILBRIDGE_BEHAVIOR_PROFILE', 'MAILBRIDGE_HTTP_ALLOW_REDIRECTS', 'MAILBRIDGE_HTTP_TIMEOUT_MS',
+    'MAILBRIDGE_KEEP_FAILED', 'MAILBRIDGE_RAW_ENCODING', 'MAILBRIDGE_SWEEP_MIN_AGE_MINUTES', 'MAILBRIDGE_SWEEP_MAX_MESSAGES']
+    .filter(name => env[name] !== undefined).map(name => `${name} = ${tomlValue(env[name])}\n`).join('')
+    + (sweepEnabled ? 'MAILBRIDGE_SWEEP = "true"\n' : '');
+  const sweepTrigger = sweepEnabled ? '\n[triggers]\ncrons = ["*/30 * * * *"]\n' : '';
   const deadLetterBinding = deadLetterQueueName ? `dead_letter_queue = ${tomlValue(deadLetterQueueName)}\n` : '';
-  const wranglerText = `name = ${tomlValue(config.workerName)}\nmain = ${tomlValue(config.workerMain || 'worker.js')}\ncompatibility_date = ${tomlValue(config.compatibilityDate || '2026-10-21')}\npreview_urls = false\n\n[vars]\nNODE_APP_URL = ${tomlValue(`https://${config.hostname}/api/webhook/email`)}\nMAIL_STORE_ENCRYPTION_VERSION = "v1"\n${workerSettings}\n[[r2_buckets]]\nbinding = "MAIL_STORE"\nbucket_name = ${tomlValue(config.r2BucketName)}\n\n[[queues.producers]]\nbinding = "MAIL_QUEUE"\nqueue = ${tomlValue(config.queueName)}\n\n[[queues.consumers]]\nqueue = ${tomlValue(config.queueName)}\nmax_batch_size = 10\nmax_batch_timeout = 5\nmax_retries = 3\n${deadLetterBinding}\n[[send_email]]\nname = "EMAIL"\n`;
+  const wranglerText = `name = ${tomlValue(config.workerName)}\nmain = ${tomlValue(config.workerMain || 'worker.js')}\ncompatibility_date = ${tomlValue(config.compatibilityDate || '2026-10-21')}\npreview_urls = false\n\n[vars]\nNODE_APP_URL = ${tomlValue(`https://${config.hostname}/api/webhook/email`)}\nMAIL_STORE_ENCRYPTION_VERSION = "v1"\n${workerSettings}${sweepTrigger}\n[[r2_buckets]]\nbinding = "MAIL_STORE"\nbucket_name = ${tomlValue(config.r2BucketName)}\n\n[[queues.producers]]\nbinding = "MAIL_QUEUE"\nqueue = ${tomlValue(config.queueName)}\n\n[[queues.consumers]]\nqueue = ${tomlValue(config.queueName)}\nmax_batch_size = 10\nmax_batch_timeout = 5\nmax_retries = 3\n${deadLetterBinding}\n[[send_email]]\nname = "EMAIL"\n`;
 
   return { envText, wranglerText, queueMasterKey, webhookSecret, cloudflareSendSecret, publicKey: generated.publicKey || '', r2BucketName: config.r2BucketName, queueName: config.queueName, deadLetterQueueName };
 }
@@ -327,6 +332,8 @@ async function runSetup({
     const compatibilityDate = priorWorkerValue('compatibility_date');
     const priorDeadLetterQueue = priorWorkerValue('dead_letter_queue');
     const deadLetterQueueEnabled = booleanSetting(existingEnv, 'MAILBRIDGE_DEAD_LETTER_QUEUE', existingEnvText === undefined || Boolean(priorDeadLetterQueue));
+    const sweepEnabled = booleanSetting(existingEnv, 'MAILBRIDGE_SWEEP', (existingEnvText === undefined && compatibility.receipts)
+      || priorWorkerValue('MAILBRIDGE_SWEEP') === 'true');
     const existingBoolean = (name, fallback) => booleanSetting(existingEnv, name, fallback);
     const pathMapping = { dataDirectory, keyDirectory, systemMode };
     const hostPath = (configured, runtimeDefault, hostDefault) => configuredHostPath(configured, runtimeDefault, hostDefault, cwd, pathMapping);
@@ -457,7 +464,7 @@ async function runSetup({
     const artifacts = generateArtifacts({ hostname, workerName, localMailHost, localMailPort, localMailRequireTls, localMailTlsServername, localMailTlsCaFile, spamAssassinMode, upstreamProvider, relayFrom, workerSendUrl, smtpRelayEnabled, allowedCidrs, smtpRelayRequireTls, smtpRelayAllowInsecure, smtpRelayTlsCertFile, smtpRelayTlsKeyFile, smtpRelayTlsCaFile, cloudflaredEnabled, cloudflareTunnelToken, r2BucketName, queueName,
       pluginDirectory: runtimePluginDirectory, pluginLockfile: runtimePluginLockfile, pluginConfigFile: runtimePluginConfigFile,
       pluginSecretEnvironment, existingEnvironment: existingEnv, existingEnvText, behaviorProfile: compatibility.profile,
-      compatibilityDate, deadLetterQueueEnabled, deadLetterQueueName: priorDeadLetterQueue, ...runtimePaths }, {
+      compatibilityDate, deadLetterQueueEnabled, deadLetterQueueName: priorDeadLetterQueue, sweepEnabled, ...runtimePaths }, {
       queueMasterKey: existingEnv.QUEUE_MASTER_KEY,
       webhookSecret: existingEnv.WEBHOOK_SECRET,
       cloudflareSendSecret: existingEnv.CLOUDFLARE_SEND_WEBHOOK_SECRET || existingEnv.WEBHOOK_SECRET,
