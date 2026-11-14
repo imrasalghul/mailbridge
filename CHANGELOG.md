@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- The Worker no longer passes `redirect: "error"` to `fetch` with redirects off (the modern default), which Cloudflare Workers reject: every queue delivery threw a `TypeError` and mail stayed in R2 (#23). It now uses `redirect: "manual"`: a redirect is never followed, so the webhook secret isn't sent elsewhere, and the delivery is retried.
+
 ## 1.4.3 — 2026-10-23
 
 ### Security

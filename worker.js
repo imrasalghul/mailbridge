@@ -265,7 +265,9 @@ function buildBridgeTransportOptions(env) {
     throw new Error("Invalid MAILBRIDGE_HTTP_TIMEOUT_MS");
   }
   return {
-    redirect: allowRedirects ? "follow" : "error",
+    // Workers reject redirect: "error". "manual" hands a redirect back as a response instead of
+    // following it, so X-Webhook-Secret never goes elsewhere; the caller treats it as a failure.
+    redirect: allowRedirects ? "follow" : "manual",
     ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
   };
 }
