@@ -130,6 +130,25 @@ test('Worker retries infrastructure failures and discards only explicit mail rej
   }
 });
 
+test('Workers reject redirect: "error": the modern profile uses "manual" and retries a redirect', async t => {
+  // Node's fetch accepts "error", so this asserts the option directly (workerd throws a TypeError on it).
+  for (const settings of [{}, { MAILBRIDGE_BEHAVIOR_PROFILE: 'modern' }, { MAILBRIDGE_HTTP_ALLOW_REDIRECTS: 'false' },
+    { MAILBRIDGE_BEHAVIOR_PROFILE: 'modern', MAILBRIDGE_HTTP_ALLOW_REDIRECTS: 'true' }]) {
+    const { state, env, msg } = queueFixture();
+    Object.assign(env, settings);
+    const requests = [];
+    t.mock.method(globalThis, 'fetch', async (url, options) => {
+      requests.push({ url: String(url), redirect: options.redirect });
+      return new Response(null, { status: 302, headers: { Location: 'https://elsewhere.example/' } });
+    });
+    await worker.queue({ messages: [msg] }, env);
+    assert.ok(['follow', 'manual'].includes(requests[0].redirect), JSON.stringify(settings));
+    assert.equal(requests.length, 1);                          // never re-sent to the redirect target
+    assert.deepEqual(state, { deleted: 0, acked: 0, retried: 1 }, JSON.stringify(settings));
+    t.mock.restoreAll();
+  }
+});
+
 test('R2 cleanup retries carry the same identity and cannot resend an accepted delivery', async t => {
   const { state, env, msg } = queueFixture();
   env.MAILBRIDGE_BEHAVIOR_PROFILE = 'modern';
@@ -142,7 +161,7 @@ test('R2 cleanup retries carry the same identity and cannot resend an accepted d
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     const headers = Object.fromEntries(new Headers(options.headers));
     assert.equal(headers['x-mailbridge-delivery-id'], msg.body.objectKey);
-    assert.equal(options.redirect, 'error');
+    assert.equal(options.redirect, 'manual');
     let status;
     let body;
     const res = { type() { return this; }, set() { return this; }, status(value) { status = value; return this; }, send(value) { body = value; } };
@@ -188,8 +207,8 @@ test('Worker transport keeps legacy redirects and has no implicit timeout until 
   const cases = [
     { settings: {}, redirect: 'follow', timeout: undefined },
     { settings: { MAILBRIDGE_BEHAVIOR_PROFILE: 'legacy' }, redirect: 'follow', timeout: undefined },
-    { settings: { MAILBRIDGE_BEHAVIOR_PROFILE: 'modern' }, redirect: 'error', timeout: 120000 },
-    { settings: { MAILBRIDGE_HTTP_ALLOW_REDIRECTS: 'false', MAILBRIDGE_HTTP_TIMEOUT_MS: '45000' }, redirect: 'error', timeout: 45000 },
+    { settings: { MAILBRIDGE_BEHAVIOR_PROFILE: 'modern' }, redirect: 'manual', timeout: 120000 },
+    { settings: { MAILBRIDGE_HTTP_ALLOW_REDIRECTS: 'false', MAILBRIDGE_HTTP_TIMEOUT_MS: '45000' }, redirect: 'manual', timeout: 45000 },
     { settings: { MAILBRIDGE_BEHAVIOR_PROFILE: 'modern', MAILBRIDGE_HTTP_ALLOW_REDIRECTS: 'true', MAILBRIDGE_HTTP_TIMEOUT_MS: '0' }, redirect: 'follow', timeout: undefined }
   ];
   for (const { settings, redirect, timeout } of cases) {
